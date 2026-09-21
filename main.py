@@ -1,12 +1,14 @@
 import os
 import json
+import hashlib
 import urllib3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import Response, HTMLResponse
 from cryptography.fernet import Fernet
-from icalendar import Calendar, Event
+from icalendar import Calendar, Event, Timezone, TimezoneStandard, TimezoneDaylight
 
 # Potlačení InsecureRequestWarning pro neověřené HTTPS požadavky
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -107,6 +109,52 @@ HTML_TEMPLATE = """
 </html>
 """
 
+def normalize_time(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        total_minutes = int(text)
+        if 0 <= total_minutes < 24 * 60:
+            hours, minutes = divmod(total_minutes, 60)
+            return f"{hours:02d}:{minutes:02d}"
+        return None
+    if ":" not in text:
+        return None
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        if 0 <= hours < 24 and 0 <= minutes < 60:
+            return f"{hours:02d}:{minutes:02d}"
+    except ValueError:
+        return None
+    return None
+
+def extract_hour_times(item):
+    start = (
+        item.get("StartTime")
+        or item.get("BeginTime")
+        or item.get("Start")
+        or item.get("TimeFrom")
+        or item.get("From")
+    )
+    end = (
+        item.get("EndTime")
+        or item.get("End")
+        or item.get("TimeTo")
+        or item.get("To")
+    )
+    start_norm = normalize_time(start)
+    end_norm = normalize_time(end)
+    if not start_norm or not end_norm:
+        return None
+    return start_norm, end_norm
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     return HTML_TEMPLATE
@@ -140,7 +188,7 @@ async def get_ical(token: str):
     }
     
     try:
-        resp = requests.post(login_url, data=payload, headers=headers, verify=False, timeout=10)
+        resp = requests.post(login_url, data=payload, headers=headers, verify=False, timeout=15)
     except requests.RequestException:
         raise HTTPException(status_code=502, detail="Chyba při komunikaci s API Bakalářů (login)")
         
@@ -151,100 +199,156 @@ async def get_ical(token: str):
     if not access_token:
         raise HTTPException(status_code=401, detail="Nebyl získán přístupový token")
         
-    # Získání aktuálního rozvrhu
-    timetable_url = "https://gyarab.bakalari.cz/api/3/timetable/actual"
     auth_headers = {
         "Authorization": f"Bearer {access_token}"
     }
+
+    tz_prague = ZoneInfo("Europe/Prague")
+    now = datetime.now(tz_prague)
     
-    try:
-        tt_resp = requests.get(timetable_url, headers=auth_headers, verify=False, timeout=10)
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="Chyba při stahování rozvrhu")
-        
-    if tt_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Selhalo načtení rozvrhu z API")
-        
-    tt_data = tt_resp.json()
-    
+    # Stáhneme rozvrh pro aktuální týden a následující 3 týdny
+    # Bakaláři API přijímá ?date=YYYY-MM-DD
+    target_dates = []
+    # Začneme pondělím aktuálního týdne - 7 dní zpět až +21 dní dopředu
+    monday_current = now - timedelta(days=now.weekday())
+    for week_offset in range(-1, 4):
+        target_monday = monday_current + timedelta(weeks=week_offset)
+        target_dates.append(target_monday.strftime("%Y-%m-%d"))
+
     # Generování iCal
     cal = Calendar()
     cal.add('prodid', '-//Bakalari iCal Sync//gyarab//')
     cal.add('version', '2.0')
-    
-    subjects = {s["Id"]: s for s in tt_data.get("Subjects", [])}
-    rooms = {r["Id"]: r for r in tt_data.get("Rooms", [])}
-    hours = {h["Id"]: h for h in tt_data.get("Hours", [])}
-    
-    for day in tt_data.get("Days", []):
-        date_str = day.get("Date", "")
-        if not date_str:
-            continue
-            
+    cal.add('x-wr-calname', 'Bakaláři Rozvrh')
+    cal.add('x-wr-timezone', 'Europe/Prague')
+
+    created_events = set()
+
+    for date_param in target_dates:
+        timetable_url = f"https://gyarab.bakalari.cz/api/3/timetable/actual?date={date_param}"
         try:
-            date_only = date_str[:10] 
-            date_obj = datetime.strptime(date_only, "%Y-%m-%d")
-        except ValueError:
+            tt_resp = requests.get(timetable_url, headers=auth_headers, verify=False, timeout=15)
+            if tt_resp.status_code != 200:
+                continue
+            tt_data = tt_resp.json()
+        except Exception:
             continue
-            
-        for atom in day.get("Atoms", []):
-            hour_id = atom.get("HourId")
-            subject_id = atom.get("SubjectId")
-            room_id = atom.get("RoomId")
-            
-            if not hour_id or not subject_id:
-                continue
-                
-            hour_info = hours.get(hour_id)
-            if not hour_info:
-                continue
-                
-            begin_time_str = hour_info.get("BeginTime")
-            end_time_str = hour_info.get("EndTime")
-            
-            if not begin_time_str or not end_time_str:
+
+        subjects = {}
+        for s in tt_data.get("Subjects", []):
+            if "Id" in s:
+                subjects[str(s["Id"])] = s
+                subjects[s["Id"]] = s
+
+        rooms = {}
+        for r in tt_data.get("Rooms", []):
+            if "Id" in r:
+                rooms[str(r["Id"])] = r
+                rooms[r["Id"]] = r
+
+        teachers = {}
+        for t in tt_data.get("Teachers", []):
+            if "Id" in t:
+                teachers[str(t["Id"])] = t
+                teachers[t["Id"]] = t
+
+        hours = {}
+        for h in tt_data.get("Hours", []):
+            h_id = h.get("Id")
+            if h_id is not None:
+                times = extract_hour_times(h)
+                if times:
+                    hours[str(h_id)] = times
+                    hours[h_id] = times
+
+        for day in tt_data.get("Days", []):
+            date_str = day.get("Date", "")
+            if not date_str:
                 continue
                 
             try:
-                h_begin, m_begin = map(int, begin_time_str.split(':'))
-                h_end, m_end = map(int, end_time_str.split(':'))
-            except ValueError:
+                date_only = date_str[:10] 
+                date_parts = [int(p) for p in date_only.split('-')]
+            except Exception:
                 continue
-            
-            dt_start = date_obj.replace(hour=h_begin, minute=m_begin, second=0)
-            dt_end = date_obj.replace(hour=h_end, minute=m_end, second=0)
-            
-            subject = subjects.get(subject_id, {})
-            subj_abbrev = subject.get("Abbrev", "Neznámý")
-            
-            room = rooms.get(room_id, {})
-            room_abbrev = room.get("Abbrev", "")
-            
-            theme = atom.get("Theme", "")
-            change = atom.get("Change")
-            
-            summary = subj_abbrev
-            if room_abbrev:
-                summary += f" ({room_abbrev})"
                 
-            description = ""
-            if theme:
-                description += f"Téma: {theme}\n"
-            if change:
-                change_desc = change.get("Description", "")
+            for atom in day.get("Atoms", []):
+                hour_id = atom.get("HourId")
+                subject_id = atom.get("SubjectId")
+                room_id = atom.get("RoomId")
+                teacher_id = atom.get("TeacherId")
+                
+                hour_info = hours.get(hour_id) or hours.get(str(hour_id))
+                if not hour_info:
+                    continue
+                    
+                start_time_str, end_time_str = hour_info
+                try:
+                    h_begin, m_begin = map(int, start_time_str.split(':'))
+                    h_end, m_end = map(int, end_time_str.split(':'))
+                    dt_start = datetime(date_parts[0], date_parts[1], date_parts[2], h_begin, m_begin, 0, tzinfo=tz_prague)
+                    dt_end = datetime(date_parts[0], date_parts[1], date_parts[2], h_end, m_end, 0, tzinfo=tz_prague)
+                except Exception:
+                    continue
+
+                subject = subjects.get(subject_id) or subjects.get(str(subject_id)) or {}
+                subj_name = subject.get("Abbrev") or subject.get("Name") or "Hodina"
+                
+                room = rooms.get(room_id) or rooms.get(str(room_id)) or {}
+                room_name = room.get("Abbrev") or room.get("Name") or ""
+                
+                teacher = teachers.get(teacher_id) or teachers.get(str(teacher_id)) or {}
+                teacher_name = teacher.get("Name") or teacher.get("Abbrev") or ""
+
+                theme = atom.get("Theme", "")
+                change = atom.get("Change")
+                if isinstance(change, dict):
+                    change_desc = change.get("Description", "")
+                    change_type = change.get("ChangeType", "")
+                else:
+                    change_desc = ""
+                    change_type = ""
+                
+                summary = subj_name
+                if room_name:
+                    summary += f" ({room_name})"
+                    
+                description_lines = []
+                if subj_name and subject.get("Name") and subject.get("Name") != subj_name:
+                    description_lines.append(f"Předmět: {subject.get('Name')}")
+                if teacher_name:
+                    description_lines.append(f"Vyučující: {teacher_name}")
+                if room_name:
+                    description_lines.append(f"Místnost: {room_name}")
+                if theme:
+                    description_lines.append(f"Téma: {theme}")
                 if change_desc:
-                    description += f"Změna: {change_desc}\n"
+                    description_lines.append(f"Změna: {change_desc}")
+                elif change_type:
+                    description_lines.append(f"Změna: {change_type}")
+                    
+                event_uid = f"{date_only}_{hour_id}_{subject_id}_{room_id}@bakalari.sync"
+                if event_uid in created_events:
+                    continue
+                created_events.add(event_uid)
+
+                event = Event()
+                event.add('summary', summary)
+                event.add('dtstart', dt_start)
+                event.add('dtend', dt_end)
+                event.add('dtstamp', now)
+                if room_name:
+                    event.add('location', room_name)
+                if description_lines:
+                    event.add('description', "\n".join(description_lines))
+                    
+                event.add('uid', event_uid)
+                cal.add_component(event)
                 
-            event = Event()
-            event.add('summary', summary)
-            event.add('dtstart', dt_start)
-            event.add('dtend', dt_end)
-            if description:
-                event.add('description', description.strip())
-                
-            uid = f"{date_only}-{hour_id}-{subject_id}@bakalari.sync"
-            event.add('uid', uid)
-            
-            cal.add_component(event)
-            
-    return Response(content=cal.to_ical(), media_type="text/calendar")
+    return Response(
+        content=cal.to_ical(),
+        media_type="text/calendar",
+        headers={
+            "Content-Disposition": "inline; filename=rozvrh.ics"
+        }
+    )
