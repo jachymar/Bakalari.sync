@@ -112,6 +112,47 @@ def make_rfc3339(date_str, time_str):
     return local_dt.isoformat()
 
 
+def _absence_status(item):
+    """Vrátí český text stavu absence z různých verzí API Bakalářů."""
+    for key in ("IsExcused", "Excused", "Omluveno"):
+        value = item.get(key)
+        if isinstance(value, bool):
+            return "omluveno" if value else "neomluveno"
+
+    value = item.get("Type") or item.get("TypeName") or item.get("Status")
+    if isinstance(value, dict):
+        value = value.get("Name") or value.get("Description") or value.get("Id")
+
+    text = str(value or "").strip().lower()
+    if any(word in text for word in ("omluv", "excused", "justif")):
+        return "omluveno"
+    return "neomluveno"
+
+
+def extract_absences(data):
+    """Vytvoří mapu (datum, HourId) -> stav absence."""
+    result = {}
+    records = data.get("Absences", data.get("Data", []))
+    if isinstance(records, dict):
+        records = records.get("Items", records.get("Absences", []))
+    if not isinstance(records, list):
+        return result
+
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+
+        date_value = item.get("Date") or item.get("Datum") or item.get("Day")
+        hour_id = item.get("HourId")
+        if date_value is None or hour_id is None:
+            continue
+
+        date_str = str(date_value)[:10]
+        result[(date_str, str(hour_id))] = _absence_status(item)
+
+    return result
+
+
 def main():
     user = os.environ["BAK_USER"]
     password = os.environ["BAK_PASS"]
@@ -134,6 +175,15 @@ def main():
     )
     response.raise_for_status()
     data = response.json()
+
+    absence_response = requests.get(
+        f"{BASE_URL}/absence/student",
+        headers=headers,
+        timeout=30,
+        verify=False,
+    )
+    absence_response.raise_for_status()
+    absences = extract_absences(absence_response.json())
 
     subjects = {
         item["Id"]: item.get("Abbrev", item.get("Name", "Hodina"))
@@ -188,17 +238,22 @@ def main():
                 else ""
             )
 
+            absence_status = absences.get((date_str, str(hour_id)))
+            description_parts = []
+            if change_info:
+                description_parts.append(f"Změna/Suplování: {change_info}")
+            else:
+                description_parts.append("Běžná hodina")
+            if absence_status:
+                description_parts.append(f"Absence: {absence_status}")
+
             raw_id = f"{date_str}_{hour_id}_{subject}"
             event_id = hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
             event_body = {
                 "id": event_id,
                 "summary": f"{subject} ({room})" if room else subject,
-                "description": (
-                    f"Změna/Suplování: {change_info}"
-                    if change_info
-                    else "Běžná hodina"
-                ),
+                "description": "\n".join(description_parts),
                 "location": room,
                 "start": {
                     "dateTime": start_iso,
@@ -209,6 +264,8 @@ def main():
                     "timeZone": "Europe/Prague",
                 },
             }
+            if absence_status:
+                event_body["colorId"] = "11"
 
             try:
                 service.events().insert(
