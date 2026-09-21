@@ -1,0 +1,24 @@
+name: Sync Bakalari Calendar
+
+on:
+  schedule:
+    - cron: '0 5,11 * * 1-5' # Běží v 5:00 a 11:00 UTC v pracovní dny
+  workflow_dispatch:        # Umožní ruční spuštění tlačítkem
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run script
+        env:
+          BAK_USER: ${{ secrets.BAK_USER }}
+          BAK_PASS: ${{ secrets.BAK_PASS }}
+          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+        run: python sync.py
+
