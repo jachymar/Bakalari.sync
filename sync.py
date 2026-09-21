@@ -7,11 +7,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
-BAK_URL = os.getenv(
-    "BAK_URL",
-    "https://gyarab.bakalari.cz",
-).rstrip("/")
-
+BAK_URL = os.getenv("BAK_URL", "https://gyarab.bakalari.cz").rstrip("/")
 BASE_URL = f"{BAK_URL}/api/3"
 
 
@@ -31,11 +27,52 @@ def get_bakalari_token(user, password):
     data = response.json()
 
     if "access_token" not in data:
-        raise RuntimeError(
-            f"Bakaláři nevrátil access_token. Odpověď: {data}"
-        )
+        raise RuntimeError(f"Bakaláři nevrátil access_token. Odpověď: {data}")
 
     return data["access_token"]
+
+
+def normalize_time(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Bakaláři může vracet "07:10:00", "07:10", "07:10:00.000000" apod.
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) >= 2:
+            hours = parts[0].zfill(2)
+            minutes = parts[1].zfill(2)
+            return f"{hours}:{minutes}"
+
+    return text
+
+
+def extract_hour_times(item):
+    start = (
+        item.get("StartTime")
+        or item.get("Start")
+        or item.get("TimeFrom")
+        or item.get("From")
+    )
+
+    end = (
+        item.get("EndTime")
+        or item.get("End")
+        or item.get("TimeTo")
+        or item.get("To")
+    )
+
+    start_norm = normalize_time(start)
+    end_norm = normalize_time(end)
+
+    if not start_norm or not end_norm:
+        return None
+
+    return start_norm, end_norm
 
 
 def main():
@@ -49,16 +86,10 @@ def main():
         scopes=["https://www.googleapis.com/auth/calendar"],
     )
 
-    service = build(
-        "calendar",
-        "v3",
-        credentials=credentials,
-    )
+    service = build("calendar", "v3", credentials=credentials)
 
     token = get_bakalari_token(user, password)
-    headers = {
-        "Authorization": f"Bearer {token}",
-    }
+    headers = {"Authorization": f"Bearer {token}"}
 
     response = requests.get(
         f"{BASE_URL}/timetable/actual",
@@ -66,26 +97,35 @@ def main():
         timeout=30,
     )
     response.raise_for_status()
-
     data = response.json()
 
     subjects = {
-        item["Id"]: item["Abbrev"]
+        item["Id"]: item.get("Abbrev", item.get("Name", "Hodina"))
         for item in data.get("Subjects", [])
+        if item.get("Id") is not None
     }
 
     rooms = {
-        item["Id"]: item["Abbrev"]
+        item["Id"]: item.get("Abbrev", item.get("Name", ""))
         for item in data.get("Rooms", [])
+        if item.get("Id") is not None
     }
 
-    hours = {
-        item["Id"]: (
-            item["StartTime"],
-            item["EndTime"],
+    hours = {}
+    for item in data.get("Hours", []):
+        hour_id = item.get("Id")
+        if hour_id is None:
+            continue
+        hour_times = extract_hour_times(item)
+        if hour_times:
+            hours[hour_id] = hour_times
+
+    if not hours:
+        sample = data.get("Hours", [])[:2]
+        raise RuntimeError(
+            "API nevrátilo správné časy vyučovacích hodin. "
+            f"Ukázka dat Hours: {sample}"
         )
-        for item in data.get("Hours", [])
-    }
 
     inserted = 0
     updated = 0
@@ -94,51 +134,30 @@ def main():
         date_str = day["Date"][:10]
 
         for atom in day.get("Atoms", []):
-            subject = subjects.get(
-                atom.get("SubjectId"),
-                "Hodina",
-            )
-
-            room = rooms.get(
-                atom.get("RoomId"),
-                "",
-            )
-
-            hour_info = hours.get(atom.get("HourId"))
+            subject = subjects.get(atom.get("SubjectId"), "Hodina")
+            room = rooms.get(atom.get("RoomId"), "")
+            hour_id = atom.get("HourId")
+            hour_info = hours.get(hour_id)
 
             if not hour_info:
                 continue
 
             start_time, end_time = hour_info
-
             start_iso = f"{date_str}T{start_time}:00"
             end_iso = f"{date_str}T{end_time}:00"
 
-            change_info = atom.get(
-                "Change",
-                {},
-            ).get(
-                "Description",
-                "",
+            change_info = (
+                atom.get("Change", {}).get("Description", "")
+                if isinstance(atom.get("Change"), dict)
+                else ""
             )
 
-            raw_id = (
-                f"{date_str}_"
-                f"{atom.get('HourId')}_"
-                f"{subject}"
-            )
-
-            event_id = hashlib.md5(
-                raw_id.encode("utf-8")
-            ).hexdigest()
+            raw_id = f"{date_str}_{hour_id}_{subject}"
+            event_id = hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
             event_body = {
                 "id": event_id,
-                "summary": (
-                    f"{subject} ({room})"
-                    if room
-                    else subject
-                ),
+                "summary": f"{subject} ({room})" if room else subject,
                 "description": (
                     f"Změna/Suplování: {change_info}"
                     if change_info
@@ -160,12 +179,13 @@ def main():
                     calendarId=calendar_id,
                     body=event_body,
                 ).execute()
-
                 inserted += 1
 
             except Exception as error:
-                # Událost už existuje, proto ji aktualizujeme.
-                if "already exists" not in str(error).lower():
+                error_text = str(error).lower()
+
+                # Pokud událost už existuje, aktualizujeme ji.
+                if "already exists" not in error_text:
                     try:
                         service.events().get(
                             calendarId=calendar_id,
@@ -179,13 +199,12 @@ def main():
                     eventId=event_id,
                     body=event_body,
                 ).execute()
-
                 updated += 1
 
     print(
         "Synchronizace úspěšně dokončena. "
         f"Nové události: {inserted}, "
-        f"aktualizované události: {updated}"
+        f"Aktualizované události: {updated}"
     )
 
 
