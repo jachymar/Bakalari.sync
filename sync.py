@@ -3,8 +3,12 @@ import json
 import hashlib
 import requests
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 BAK_URL = os.getenv("BAK_URL", "https://gyarab.bakalari.cz").rstrip("/")
@@ -25,7 +29,6 @@ def get_bakalari_token(user, password):
     response.raise_for_status()
 
     data = response.json()
-
     if "access_token" not in data:
         raise RuntimeError(f"Bakaláři nevrátil access_token. Odpověď: {data}")
 
@@ -40,7 +43,6 @@ def normalize_time(value):
     if not text:
         return None
 
-    # Bakaláři může vracet "07:10:00", "07:10", "07:10:00.000000" apod.
     if ":" in text:
         parts = text.split(":")
         if len(parts) >= 2:
@@ -58,7 +60,6 @@ def extract_hour_times(item):
         or item.get("TimeFrom")
         or item.get("From")
     )
-
     end = (
         item.get("EndTime")
         or item.get("End")
@@ -75,6 +76,21 @@ def extract_hour_times(item):
     return start_norm, end_norm
 
 
+def make_rfc3339(date_str, time_str):
+    """
+    Převádí datum a čas do RFC3339 formátu s časovou zónou Europe/Prague.
+    Příklad: 2026-09-21T07:10:00+02:00
+    """
+    time_str = str(time_str).strip()
+    if len(time_str.split(":")) == 2:
+        time_str = f"{time_str}:00"
+
+    local_dt = datetime.fromisoformat(f"{date_str}T{time_str}").replace(
+        tzinfo=ZoneInfo("Europe/Prague")
+    )
+    return local_dt.isoformat()
+
+
 def main():
     user = os.environ["BAK_USER"]
     password = os.environ["BAK_PASS"]
@@ -85,7 +101,6 @@ def main():
         creds_dict,
         scopes=["https://www.googleapis.com/auth/calendar"],
     )
-
     service = build("calendar", "v3", credentials=credentials)
 
     token = get_bakalari_token(user, password)
@@ -143,8 +158,8 @@ def main():
                 continue
 
             start_time, end_time = hour_info
-            start_iso = f"{date_str}T{start_time}:00"
-            end_iso = f"{date_str}T{end_time}:00"
+            start_iso = make_rfc3339(date_str, start_time)
+            end_iso = make_rfc3339(date_str, end_time)
 
             change_info = (
                 atom.get("Change", {}).get("Description", "")
@@ -181,18 +196,10 @@ def main():
                 ).execute()
                 inserted += 1
 
-            except Exception as error:
-                error_text = str(error).lower()
-
-                # Pokud událost už existuje, aktualizujeme ji.
-                if "already exists" not in error_text:
-                    try:
-                        service.events().get(
-                            calendarId=calendar_id,
-                            eventId=event_id,
-                        ).execute()
-                    except Exception:
-                        raise
+            except HttpError as error:
+                # 409 = už existuje, pak aktualizujeme
+                if error.resp.status != 409:
+                    raise
 
                 service.events().update(
                     calendarId=calendar_id,
