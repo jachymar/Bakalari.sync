@@ -43,14 +43,30 @@ def normalize_time(value):
     if not text:
         return None
 
-    if ":" in text:
-        parts = text.split(":")
-        if len(parts) >= 2:
-            hours = parts[0].zfill(2)
-            minutes = parts[1].zfill(2)
-            return f"{hours}:{minutes}"
+    # Bakaláři sometimes returns minutes since midnight, e.g. 465 -> 07:45
+    if text.isdigit():
+        total_minutes = int(text)
+        if 0 <= total_minutes < 24 * 60:
+            hours, minutes = divmod(total_minutes, 60)
+            return f"{hours:02d}:{minutes:02d}"
+        return None
 
-    return text
+    if ":" not in text:
+        return None
+
+    parts = text.split(":")
+    if len(parts) != 2:
+        return None
+
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        if not (0 <= hours < 24 and 0 <= minutes < 60):
+            return None
+    except ValueError:
+        return None
+
+    return f"{hours:02d}:{minutes:02d}"
 
 
 def extract_hour_times(item):
@@ -81,13 +97,18 @@ def make_rfc3339(date_str, time_str):
     Převádí datum a čas do RFC3339 formátu s časovou zónou Europe/Prague.
     Příklad: 2026-09-21T07:10:00+02:00
     """
-    time_str = str(time_str).strip()
-    if len(time_str.split(":")) == 2:
-        time_str = f"{time_str}:00"
+    normalized = normalize_time(time_str)
+    if normalized is None:
+        raise ValueError(
+            f"Neplatný čas z Bakaláři API: {time_str!r} "
+            f"(datum {date_str!r})"
+        )
 
-    local_dt = datetime.fromisoformat(f"{date_str}T{time_str}").replace(
-        tzinfo=ZoneInfo("Europe/Prague")
-    )
+    local_dt = datetime.strptime(
+        f"{date_str}T{normalized}",
+        "%Y-%m-%dT%H:%M",
+    ).replace(tzinfo=ZoneInfo("Europe/Prague"))
+
     return local_dt.isoformat()
 
 
