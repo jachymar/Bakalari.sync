@@ -6,11 +6,12 @@ from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-BASE_URL = "https://bakalari.gyarab.cz/api/3"
+BASE_URL = "https://gyarab.bakalari.cz/api/3"
+LOGIN_URL = "https://gyarab.bakalari.cz/api/login"
 
 def get_bakalari_token(user, password):
     res = requests.post(
-        "https://bakalari.gyarab.cz/api/login",
+        LOGIN_URL,
         data={
             "client_id": "ANDR",
             "grant_type": "password",
