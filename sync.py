@@ -363,6 +363,55 @@ def fetch_timetable_for_date(headers, date_str):
     return None
 
 
+def should_sync_now(day_data, current_time=None):
+    """Vrátí True, pokud je teď přesně 20 minut po začátku vyučovací hodiny."""
+    if current_time is None:
+        current_dt = datetime.now(ZoneInfo("Europe/Prague"))
+    else:
+        current_dt = datetime.fromisoformat(current_time)
+        if current_dt.tzinfo is None:
+            current_dt = current_dt.replace(tzinfo=ZoneInfo("Europe/Prague"))
+        current_dt = current_dt.astimezone(ZoneInfo("Europe/Prague"))
+
+    if isinstance(day_data, dict):
+        days = day_data.get("Days", [])
+    else:
+        days = day_data
+
+    for day in days:
+        if isinstance(day, dict):
+            date_value = str(day.get("Date") or "")[:10]
+            atoms = day.get("Atoms", [])
+            if not date_value or date_value != current_dt.strftime("%Y-%m-%d"):
+                continue
+            if is_day_cancelled(day):
+                continue
+        else:
+            date_value = current_dt.strftime("%Y-%m-%d")
+            atoms = day_data if isinstance(day_data, list) else []
+
+        for atom in atoms:
+            if not isinstance(atom, dict):
+                continue
+            if atom.get("HourId") is None:
+                continue
+            start = atom.get("StartTime") or atom.get("Start") or atom.get("TimeFrom") or atom.get("From")
+            if start is None:
+                continue
+            normalized_start = normalize_time(start)
+            if normalized_start is None:
+                continue
+            try:
+                lesson_start = datetime.strptime(
+                    f"{date_value}T{normalized_start}", "%Y-%m-%dT%H:%M"
+                ).replace(tzinfo=ZoneInfo("Europe/Prague"))
+            except ValueError:
+                continue
+            if lesson_start + timedelta(minutes=20) == current_dt:
+                return True
+    return False
+
+
 def merge_timetable_data(base_data, extra_data):
     """Spojí rozvrhy z aktuálního a následujícího týdne do jednoho datasetu."""
     if not extra_data:
@@ -445,6 +494,10 @@ def main():
     next_data = fetch_timetable_for_date(headers, next_week.isoformat())
     if next_data is not None:
         data = merge_timetable_data(data, next_data)
+
+    if not should_sync_now(data):
+        print("Synchronizace přeskočena: není 20 minut po začátku vyučovací hodiny.")
+        return
 
     absence_response = requests.get(
         f"{BASE_URL}/absence/student",

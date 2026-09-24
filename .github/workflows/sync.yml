@@ -1,8 +1,12 @@
 name: Sync Bakalari Calendar
 
+# Synchronizace rozvrhu z Bakalářů probíhá přes GitHub Actions:
+# - každých 5 minut ve všední dny
+# - vnitřně script zkontroluje, zda právě uplynulo přesně 20 minut od začátku nějaké vyučovací hodiny
+# - ručně lze spustit i přes workflow_dispatch
 on:
   schedule:
-    - cron: '0 5,11 * * 1-5'
+    - cron: '*/5 * * * 1-5'
   workflow_dispatch:
 
 jobs:

@@ -36,6 +36,23 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "current-calendar",
         )
 
+    def test_should_sync_20_minutes_after_lesson_starts(self):
+        today = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
+        lesson_starts = {
+            "Days": [
+                {
+                    "Date": f"{today}",
+                    "Atoms": [
+                        {"HourId": 1, "Date": f"{today}", "StartTime": "08:00", "EndTime": "08:45"},
+                        {"HourId": 2, "Date": f"{today}", "StartTime": "09:00", "EndTime": "09:45"},
+                    ],
+                }
+            ]
+        }
+        self.assertTrue(sync.should_sync_now(lesson_starts, f"{today}T08:20:00+01:00"))
+        self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T08:00:00+01:00"))
+        self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T09:10:00+01:00"))
+
 
 if __name__ == "__main__":
     unittest.main()
