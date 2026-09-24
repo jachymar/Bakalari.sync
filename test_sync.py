@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import sync
 
@@ -52,6 +53,26 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertTrue(sync.should_sync_now(lesson_starts, f"{today}T08:20:00+01:00"))
         self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T08:00:00+01:00"))
         self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T09:10:00+01:00"))
+
+    def test_execute_with_backoff_retries_rate_limits(self):
+        attempts = {"count": 0}
+
+        class FakeRequest:
+            def execute(self):
+                attempts["count"] += 1
+                if attempts["count"] < 3:
+                    raise sync.HttpError(
+                        type("Resp", (), {"status": 429, "reason": "Too Many Requests"})(),
+                        b'{"error": {"errors": [{"reason": "rateLimitExceeded"}]}}',
+                    )
+                return {"ok": True}
+
+        with mock.patch.object(sync.time, "sleep") as sleep_mock:
+            result = sync.execute_with_backoff(FakeRequest(), attempts=4)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
 
 if __name__ == "__main__":

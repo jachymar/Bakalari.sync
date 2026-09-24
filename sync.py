@@ -1,7 +1,9 @@
 import os
 import json
 import hashlib
+import random
 import re
+import time
 import unicodedata
 import requests
 
@@ -255,6 +257,38 @@ def _event_id(date_str, start_time, title):
     return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
 
+def execute_with_backoff(request, attempts=6):
+    """Retry transient Google Calendar errors with exponential backoff."""
+    for attempt in range(attempts):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            reason = ""
+            payload = getattr(exc, "content", None)
+            if payload:
+                reason = payload.decode("utf-8", errors="replace")
+
+            retryable = (
+                status in (429, 500, 502, 503, 504)
+                or "rateLimitExceeded" in reason
+                or "userRateLimitExceeded" in reason
+                or "quotaExceeded" in reason
+            )
+
+            if not retryable or attempt == attempts - 1:
+                raise
+
+            delay = min(60, 2 ** attempt) + random.uniform(0, 1)
+            print(
+                "Google Calendar request was rate-limited; "
+                f"retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Google Calendar request failed without a result.")
+
+
 def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id):
     """Vybere kalendář: aktuální pro blízké dny, permanent pro další týden."""
     if not current_calendar_id:
@@ -317,7 +351,7 @@ def event_color_for(change_info, title):
 
 def _delete_event(service, calendar_id, event_id):
     try:
-        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        execute_with_backoff(service.events().delete(calendarId=calendar_id, eventId=event_id))
     except HttpError as error:
         if error.resp.status != 404:
             raise
@@ -603,12 +637,20 @@ def main():
                 event_body["colorId"] = color_id
 
             try:
-                service.events().insert(calendarId=target_calendar_id, body=event_body).execute()
+                execute_with_backoff(
+                    service.events().insert(calendarId=target_calendar_id, body=event_body)
+                )
                 inserted += 1
             except HttpError as error:
                 if error.resp.status != 409:
                     raise
-                service.events().update(calendarId=target_calendar_id, eventId=event_id, body=event_body).execute()
+                execute_with_backoff(
+                    service.events().update(
+                        calendarId=target_calendar_id,
+                        eventId=event_id,
+                        body=event_body,
+                    )
+                )
                 updated += 1
 
             index = next_index
