@@ -38,21 +38,32 @@ class SpecialEventGroupingTests(unittest.TestCase):
         )
 
     def test_should_sync_20_minutes_after_lesson_starts(self):
-        today = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
+        base_zone = sync.ZoneInfo("Europe/Prague")
+        today = sync.datetime.now(base_zone)
+        today_str = today.strftime("%Y-%m-%d")
         lesson_starts = {
             "Days": [
                 {
-                    "Date": f"{today}",
+                    "Date": today_str,
                     "Atoms": [
-                        {"HourId": 1, "Date": f"{today}", "StartTime": "08:00", "EndTime": "08:45"},
-                        {"HourId": 2, "Date": f"{today}", "StartTime": "09:00", "EndTime": "09:45"},
+                        {"HourId": 1, "Date": today_str, "StartTime": "08:00", "EndTime": "08:45"},
+                        {"HourId": 2, "Date": today_str, "StartTime": "09:00", "EndTime": "09:45"},
                     ],
                 }
             ]
         }
-        self.assertTrue(sync.should_sync_now(lesson_starts, f"{today}T08:20:00+01:00"))
-        self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T08:00:00+01:00"))
-        self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T09:10:00+01:00"))
+        self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=20, second=0, microsecond=0).isoformat()))
+        self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=25, second=0, microsecond=0).isoformat()))
+        self.assertFalse(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=0, second=0, microsecond=0).isoformat()))
+        self.assertFalse(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=15, second=0, microsecond=0).isoformat()))
+
+    def test_event_id_is_stable_when_summary_changes(self):
+        today = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
+        subject = "Matematika"
+        first_event_id = sync._event_id(today, "08:00", "Matematika (A101)")
+        second_event_id = sync._event_id(today, "08:00", "Matematika (A102)")
+        self.assertEqual(first_event_id, second_event_id)
+        self.assertEqual(first_event_id, sync._event_id(today, "08:00", subject))
 
     def test_extract_teacher_name_prefers_teacher_data(self):
         atom = {

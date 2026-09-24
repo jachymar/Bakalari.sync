@@ -289,8 +289,10 @@ def extract_teacher_name(atom):
     return None
 
 
-def _event_id(date_str, start_time, title):
-    raw_id = f"{date_str}_{start_time}_{title}"
+def _event_id(date_str, start_time, subject):
+    normalized_subject = str(subject or "").strip()
+    normalized_subject = re.sub(r"\s*\([^)]*\)\s*$", "", normalized_subject)
+    raw_id = f"{date_str}_{start_time}_{normalized_subject}"
     return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
 
@@ -478,7 +480,7 @@ def should_sync_now(day_data, current_time=None):
                 ).replace(tzinfo=ZoneInfo("Europe/Prague"))
             except ValueError:
                 continue
-            if lesson_start + timedelta(minutes=20) == current_dt:
+            if lesson_start + timedelta(minutes=20) <= current_dt:
                 return True
     return False
 
@@ -663,7 +665,7 @@ def main():
                 description_parts.append(f"Absence: {absence_status}")
 
             summary = title or (f"{subject} ({room})" if room else subject)
-            event_id = _event_id(date_str, start_time, summary)
+            event_id = _event_id(date_str, start_time, subject)
             event_body = {
                 "id": event_id,
                 "summary": summary,
