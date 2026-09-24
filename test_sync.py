@@ -19,7 +19,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
 
     def test_special_events_are_green_and_cancellations_skip_day(self):
         self.assertEqual(sync.event_color_for("", "Exkurze"), "2")
-        self.assertEqual(sync.event_color_for("Suplování", ""), "6")
+        self.assertEqual(sync.event_color_for("Suplování", ""), None)
         self.assertTrue(sync.is_day_cancelled({"IsHoliday": True}))
         self.assertTrue(sync.is_day_cancelled({"Name": "Svátek"}))
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))

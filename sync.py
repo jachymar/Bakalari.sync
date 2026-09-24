@@ -310,8 +310,6 @@ def is_day_cancelled(day):
 
 def event_color_for(change_info, title):
     """Vrátí barvu Google kalendáře pro typ události."""
-    if change_info:
-        return "6"
     if title:
         return "2"
     return None
@@ -323,6 +321,74 @@ def _delete_event(service, calendar_id, event_id):
     except HttpError as error:
         if error.resp.status != 404:
             raise
+
+
+def build_timetable_urls(date_str):
+    """Vrátí pravděpodobné Bakaláři endpointy pro zvolený den / týden."""
+    candidates = [
+        f"{BASE_URL}/timetable/actual?date={date_str}",
+        f"{BASE_URL}/timetable?date={date_str}",
+        f"{BASE_URL}/timetable/actual?day={date_str}",
+        f"{BASE_URL}/timetable/actual?from={date_str}&to={date_str}",
+    ]
+
+    if "-" in date_str:
+        monday = datetime.strptime(date_str, "%Y-%m-%d").date() - timedelta(days=datetime.strptime(date_str, "%Y-%m-%d").weekday())
+        sunday = monday + timedelta(days=6)
+        candidates.extend(
+            [
+                f"{BASE_URL}/timetable/actual?from={monday.isoformat()}&to={sunday.isoformat()}",
+                f"{BASE_URL}/timetable?from={monday.isoformat()}&to={sunday.isoformat()}",
+            ]
+        )
+
+    return list(dict.fromkeys(candidates))
+
+
+def fetch_timetable_for_date(headers, date_str):
+    """Načte rozvrh pro den nebo týden z Bakalářů a vrátí JSON nebo None."""
+    for url in build_timetable_urls(date_str):
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("Days") or payload.get("Hours") or payload.get("Subjects") or payload.get("Rooms"):
+            return payload
+
+    return None
+
+
+def merge_timetable_data(base_data, extra_data):
+    """Spojí rozvrhy z aktuálního a následujícího týdne do jednoho datasetu."""
+    if not extra_data:
+        return base_data
+
+    for key in ("Days", "Hours", "Subjects", "Rooms"):
+        extra_items = extra_data.get(key, [])
+        if not isinstance(extra_items, list):
+            continue
+        base_items = base_data.setdefault(key, [])
+        if not isinstance(base_items, list):
+            base_items = []
+            base_data[key] = base_items
+
+        seen = {item.get("Id") for item in base_items if isinstance(item, dict) and item.get("Id") is not None}
+        for item in extra_items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("Id")
+            if item_id is not None and item_id in seen:
+                continue
+            base_items.append(item)
+            if item_id is not None:
+                seen.add(item_id)
+
+    return base_data
 
 
 def group_special_event_atoms(atoms, start_index):
@@ -363,13 +429,22 @@ def main():
     token = get_bakalari_token(user, password)
     headers = {"Authorization": f"Bearer {token}"}
 
-    response = requests.get(
-        f"{BASE_URL}/timetable/actual",
-        headers=headers,
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
+    today = datetime.now(ZoneInfo("Europe/Prague")).date()
+    monday = today - timedelta(days=today.weekday())
+    data = fetch_timetable_for_date(headers, monday.isoformat())
+    if data is None:
+        response = requests.get(
+            f"{BASE_URL}/timetable/actual",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    next_week = monday + timedelta(days=7)
+    next_data = fetch_timetable_for_date(headers, next_week.isoformat())
+    if next_data is not None:
+        data = merge_timetable_data(data, next_data)
 
     absence_response = requests.get(
         f"{BASE_URL}/absence/student",
