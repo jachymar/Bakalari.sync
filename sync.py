@@ -255,12 +255,77 @@ def _event_id(date_str, start_time, title):
     return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
 
+def is_day_cancelled(day):
+    """Vrátí True, pokud je daný den svátek nebo zrušený."""
+    if not isinstance(day, dict):
+        return False
+
+    for key in (
+        "IsCancelled",
+        "Cancelled",
+        "IsHoliday",
+        "Holiday",
+        "IsNonTeachingDay",
+        "IsFreeDay",
+        "IsOff",
+    ):
+        value = day.get(key)
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str):
+            text = value.strip().casefold()
+            if text in {"true", "yes", "ano", "svatek", "svátek", "zruseno", "zrušeno", "holiday"}:
+                return True
+
+    for key in ("Type", "TypeName", "Name", "DayType", "State"):
+        value = day.get(key)
+        if isinstance(value, dict):
+            value = value.get("Name") or value.get("Description") or value.get("Type") or value.get("Code")
+        text = str(value or "").strip().casefold()
+        if not text:
+            continue
+        if any(word in text for word in ("svátek", "svatek", "holiday", "day off", "dny off", "zrušeno", "zruseno", "cancelled", "canceled")):
+            return True
+
+    return False
+
+
+def event_color_for(change_info, title):
+    """Vrátí barvu Google kalendáře pro typ události."""
+    if change_info:
+        return "6"
+    if title:
+        return "2"
+    return None
+
+
 def _delete_event(service, calendar_id, event_id):
     try:
         service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
     except HttpError as error:
         if error.resp.status != 404:
             raise
+
+
+def group_special_event_atoms(atoms, start_index):
+    """Spojí sousední části jedné vícedobové akce i přes přestávky."""
+    atom, subject, hour_info = atoms[start_index]
+    title = _special_title(atom, subject)
+    if not title:
+        return [(atom, subject, hour_info)], start_index + 1
+
+    group = [(atom, subject, hour_info)]
+    next_index = start_index + 1
+    while next_index < len(atoms):
+        next_atom, next_subject, next_info = atoms[next_index]
+        if _is_cancelled(next_atom, next_subject):
+            break
+        if _special_title(next_atom, next_subject) != title:
+            break
+        group.append((next_atom, next_subject, next_info))
+        next_index += 1
+
+    return group, next_index
 
 
 def main():
@@ -331,7 +396,10 @@ def main():
     deleted = 0
 
     for day in data.get("Days", []):
-        date_str = day["Date"][:10]
+        date_str = day.get("Date", "")[:10]
+        if is_day_cancelled(day):
+            continue
+
         atoms = []
         for atom in day.get("Atoms", []):
             subject = subjects.get(atom.get("SubjectId"), "Hodina")
@@ -339,10 +407,13 @@ def main():
             if hour_info:
                 atoms.append((atom, subject, hour_info))
 
+        if not atoms:
+            continue
+
         index = 0
         while index < len(atoms):
             atom, subject, hour_info = atoms[index]
-            start_time, end_time = hour_info
+            start_time, _ = hour_info
             title = _special_title(atom, subject)
 
             if _is_cancelled(atom, subject):
@@ -351,21 +422,11 @@ def main():
                 index += 1
                 continue
 
-            group = [(atom, subject, hour_info)]
+            group, next_index = group_special_event_atoms(atoms, index)
             if title:
-                next_index = index + 1
-                while next_index < len(atoms):
-                    next_atom, next_subject, next_info = atoms[next_index]
-                    if _is_cancelled(next_atom, next_subject):
-                        break
-                    next_title = _special_title(next_atom, next_subject)
-                    if next_title != title or next_info[0] != group[-1][2][1]:
-                        break
-                    group.append((next_atom, next_subject, next_info))
-                    next_index += 1
-                end_time = group[-1][2][1]
+                end_time = max(hour_data[1] for _, _, hour_data in group)
             else:
-                next_index = index + 1
+                end_time = hour_info[1]
 
             first_atom = group[0][0]
             room = rooms.get(first_atom.get("RoomId"), "")
@@ -389,10 +450,9 @@ def main():
                 "start": {"dateTime": make_rfc3339(date_str, start_time), "timeZone": "Europe/Prague"},
                 "end": {"dateTime": make_rfc3339(date_str, end_time), "timeZone": "Europe/Prague"},
             }
-            if change_info:
-                event_body["colorId"] = "6"  # Google Calendar: tangerine/oranžová
-            elif absence_status:
-                event_body["colorId"] = "11"
+            color_id = event_color_for(change_info, title)
+            if color_id is not None:
+                event_body["colorId"] = color_id
 
             try:
                 service.events().insert(calendarId=calendar_id, body=event_body).execute()
@@ -403,7 +463,7 @@ def main():
                 service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
                 updated += 1
 
-            index += len(group)
+            index = next_index
 
     print(
         "Synchronizace úspěšně dokončena. "
