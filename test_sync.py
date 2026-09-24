@@ -24,6 +24,18 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertTrue(sync.is_day_cancelled({"Name": "Svátek"}))
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))
 
+    def test_next_week_uses_permanent_calendar(self):
+        future_date = (sync.datetime.now(sync.ZoneInfo("Europe/Prague")) + sync.timedelta(days=8)).strftime("%Y-%m-%d")
+        self.assertEqual(
+            sync.select_calendar_id(future_date, "current-calendar", "permanent-calendar"),
+            "permanent-calendar",
+        )
+        today_date = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
+        self.assertEqual(
+            sync.select_calendar_id(today_date, "current-calendar", "permanent-calendar"),
+            "current-calendar",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

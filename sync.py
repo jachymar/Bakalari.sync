@@ -5,7 +5,7 @@ import re
 import unicodedata
 import requests
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
@@ -255,6 +255,24 @@ def _event_id(date_str, start_time, title):
     return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
 
 
+def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id):
+    """Vybere kalendář: aktuální pro blízké dny, permanent pro další týden."""
+    if not current_calendar_id:
+        return permanent_calendar_id
+    if not permanent_calendar_id:
+        return current_calendar_id
+
+    try:
+        event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return current_calendar_id
+
+    today = datetime.now(ZoneInfo("Europe/Prague")).date()
+    if event_date >= today + timedelta(days=7):
+        return permanent_calendar_id
+    return current_calendar_id
+
+
 def is_day_cancelled(day):
     """Vrátí True, pokud je daný den svátek nebo zrušený."""
     if not isinstance(day, dict):
@@ -331,7 +349,8 @@ def group_special_event_atoms(atoms, start_index):
 def main():
     user = os.environ["BAK_USER"]
     password = os.environ["BAK_PASS"]
-    calendar_id = os.environ["CALENDAR_ID"]
+    current_calendar_id = os.environ.get("CALENDAR_ID") or os.environ.get("CURRENT_CALENDAR_ID")
+    permanent_calendar_id = os.environ.get("PERMANENT_CALENDAR_ID")
     creds_dict = json.loads(os.environ["GOOGLE_CREDS_JSON"])
     room_mapping = load_room_mapping()
 
@@ -415,9 +434,10 @@ def main():
             atom, subject, hour_info = atoms[index]
             start_time, _ = hour_info
             title = _special_title(atom, subject)
+            target_calendar_id = select_calendar_id(date_str, current_calendar_id, permanent_calendar_id)
 
             if _is_cancelled(atom, subject):
-                _delete_event(service, calendar_id, _event_id(date_str, start_time, subject))
+                _delete_event(service, target_calendar_id, _event_id(date_str, start_time, subject))
                 deleted += 1
                 index += 1
                 continue
@@ -455,12 +475,12 @@ def main():
                 event_body["colorId"] = color_id
 
             try:
-                service.events().insert(calendarId=calendar_id, body=event_body).execute()
+                service.events().insert(calendarId=target_calendar_id, body=event_body).execute()
                 inserted += 1
             except HttpError as error:
                 if error.resp.status != 409:
                     raise
-                service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
+                service.events().update(calendarId=target_calendar_id, eventId=event_id, body=event_body).execute()
                 updated += 1
 
             index = next_index
