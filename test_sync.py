@@ -54,6 +54,15 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T08:00:00+01:00"))
         self.assertFalse(sync.should_sync_now(lesson_starts, f"{today}T09:10:00+01:00"))
 
+    def test_extract_teacher_name_prefers_teacher_data(self):
+        atom = {
+            "Teacher": {"Name": "Mgr. Nováková"},
+            "RoomId": 5,
+        }
+        self.assertEqual(sync.extract_teacher_name(atom), "Mgr. Nováková")
+        self.assertEqual(sync.extract_teacher_name({"Teacher": "Pavel Horák"}), "Pavel Horák")
+        self.assertIsNone(sync.extract_teacher_name({}))
+
     def test_execute_with_backoff_retries_rate_limits(self):
         attempts = {"count": 0}
 

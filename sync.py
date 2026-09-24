@@ -252,6 +252,43 @@ def _change_description(atom):
     return ""
 
 
+def extract_teacher_name(atom):
+    """Vrátí jméno vyučujícího z dat hodiny, pokud je dostupné."""
+    if not isinstance(atom, dict):
+        return None
+
+    for key in (
+        "Teacher",
+        "TeacherName",
+        "TeacherShortName",
+        "TeacherDisplayName",
+        "TeacherAbbrev",
+        "TeacherLabel",
+        "TeacherFullName",
+    ):
+        value = atom.get(key)
+        if isinstance(value, dict):
+            for nested_key in (
+                "Name",
+                "FullName",
+                "DisplayName",
+                "ShortName",
+                "Abbrev",
+                "Title",
+            ):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str):
+                    nested_value = nested_value.strip()
+                    if nested_value:
+                        return nested_value
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+
+    return None
+
+
 def _event_id(date_str, start_time, title):
     raw_id = f"{date_str}_{start_time}_{title}"
     return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
@@ -615,10 +652,13 @@ def main():
             change_info = _change_description(first_atom)
             absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
             description_parts = []
+            teacher_name = extract_teacher_name(first_atom)
+            if teacher_name:
+                description_parts.append(f"Vyučuje: {teacher_name}")
+            elif not change_info:
+                description_parts.append("Běžná hodina")
             if change_info:
                 description_parts.append(f"Změna/Suplování: {change_info}")
-            else:
-                description_parts.append("Běžná hodina")
             if absence_status:
                 description_parts.append(f"Absence: {absence_status}")
 
