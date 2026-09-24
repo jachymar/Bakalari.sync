@@ -18,6 +18,29 @@ BASE_URL = f"{BAK_URL}/api/3"
 ROOM_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "room_mapping.json")
 
 
+CANCELLED_WORDS = (
+    "zruš",
+    "zrus",
+    "cancel",
+    "odpad",
+)
+SPECIAL_EVENT_WORDS = (
+    "exkurz",
+    "výlet",
+    "vylet",
+    "projekt",
+    "olympiád",
+    "olympiad",
+    "akce",
+    "besed",
+    "koncert",
+    "divadl",
+    "kurz",
+    "přednáš",
+    "prednas",
+)
+
+
 def normalize_room_name(value):
     """Normalizuje názvy učeben pro porovnání různých variant."""
     text = unicodedata.normalize("NFKD", str(value or ""))
@@ -123,10 +146,7 @@ def extract_hour_times(item):
 
 
 def make_rfc3339(date_str, time_str):
-    """
-    Převádí datum a čas do RFC3339 formátu s časovou zónou Europe/Prague.
-    Příklad: 2026-09-21T07:10:00+02:00
-    """
+    """Převádí datum a čas do RFC3339 formátu s časovou zónou Europe/Prague."""
     normalized = normalize_time(time_str)
     if normalized is None:
         raise ValueError(
@@ -181,6 +201,66 @@ def extract_absences(data):
         result[(date_str, str(hour_id))] = _absence_status(item)
 
     return result
+
+
+def _atom_text(atom, subject):
+    change = atom.get("Change")
+    values = [subject]
+    if isinstance(change, dict):
+        values.extend(
+            str(change.get(key, ""))
+            for key in ("Description", "Name", "Type", "TypeName")
+        )
+    values.extend(
+        str(atom.get(key, ""))
+        for key in ("Description", "Name", "Type", "TypeName")
+    )
+    return " ".join(values).strip()
+
+
+def _is_cancelled(atom, subject):
+    text = _atom_text(atom, subject).casefold()
+    return any(word in text for word in CANCELLED_WORDS)
+
+
+def _special_title(atom, subject):
+    """Vrátí název vícedohodinové akce, nebo None pro běžnou hodinu."""
+    text = _atom_text(atom, subject)
+    folded = text.casefold()
+    if not any(word in folded for word in SPECIAL_EVENT_WORDS):
+        return None
+
+    change = atom.get("Change")
+    candidates = []
+    if isinstance(change, dict):
+        candidates.extend(change.get(key) for key in ("Description", "Name"))
+    candidates.extend(atom.get(key) for key in ("Description", "Name"))
+    candidates.append(subject)
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and not any(word in value.casefold() for word in CANCELLED_WORDS):
+            return value
+    return subject
+
+
+def _change_description(atom):
+    change = atom.get("Change")
+    if isinstance(change, dict):
+        return str(change.get("Description") or change.get("Name") or "").strip()
+    return ""
+
+
+def _event_id(date_str, start_time, title):
+    raw_id = f"{date_str}_{start_time}_{title}"
+    return hashlib.md5(raw_id.encode("utf-8")).hexdigest()
+
+
+def _delete_event(service, calendar_id, event_id):
+    try:
+        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+    except HttpError as error:
+        if error.resp.status != 404:
+            raise
 
 
 def main():
@@ -248,30 +328,49 @@ def main():
 
     inserted = 0
     updated = 0
+    deleted = 0
 
     for day in data.get("Days", []):
         date_str = day["Date"][:10]
-
+        atoms = []
         for atom in day.get("Atoms", []):
             subject = subjects.get(atom.get("SubjectId"), "Hodina")
-            room = rooms.get(atom.get("RoomId"), "")
-            hour_id = atom.get("HourId")
-            hour_info = hours.get(hour_id)
+            hour_info = hours.get(atom.get("HourId"))
+            if hour_info:
+                atoms.append((atom, subject, hour_info))
 
-            if not hour_info:
+        index = 0
+        while index < len(atoms):
+            atom, subject, hour_info = atoms[index]
+            start_time, end_time = hour_info
+            title = _special_title(atom, subject)
+
+            if _is_cancelled(atom, subject):
+                _delete_event(service, calendar_id, _event_id(date_str, start_time, subject))
+                deleted += 1
+                index += 1
                 continue
 
-            start_time, end_time = hour_info
-            start_iso = make_rfc3339(date_str, start_time)
-            end_iso = make_rfc3339(date_str, end_time)
+            group = [(atom, subject, hour_info)]
+            if title:
+                next_index = index + 1
+                while next_index < len(atoms):
+                    next_atom, next_subject, next_info = atoms[next_index]
+                    if _is_cancelled(next_atom, next_subject):
+                        break
+                    next_title = _special_title(next_atom, next_subject)
+                    if next_title != title or next_info[0] != group[-1][2][1]:
+                        break
+                    group.append((next_atom, next_subject, next_info))
+                    next_index += 1
+                end_time = group[-1][2][1]
+            else:
+                next_index = index + 1
 
-            change_info = (
-                atom.get("Change", {}).get("Description", "")
-                if isinstance(atom.get("Change"), dict)
-                else ""
-            )
-
-            absence_status = absences.get((date_str, str(hour_id)))
+            first_atom = group[0][0]
+            room = rooms.get(first_atom.get("RoomId"), "")
+            change_info = _change_description(first_atom)
+            absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
             description_parts = []
             if change_info:
                 description_parts.append(f"Změna/Suplování: {change_info}")
@@ -280,49 +379,36 @@ def main():
             if absence_status:
                 description_parts.append(f"Absence: {absence_status}")
 
-            raw_id = f"{date_str}_{hour_id}_{subject}"
-            event_id = hashlib.md5(raw_id.encode("utf-8")).hexdigest()
-
+            summary = title or (f"{subject} ({room})" if room else subject)
+            event_id = _event_id(date_str, start_time, summary)
             event_body = {
                 "id": event_id,
-                "summary": f"{subject} ({room})" if room else subject,
+                "summary": summary,
                 "description": "\n".join(description_parts),
                 "location": room,
-                "start": {
-                    "dateTime": start_iso,
-                    "timeZone": "Europe/Prague",
-                },
-                "end": {
-                    "dateTime": end_iso,
-                    "timeZone": "Europe/Prague",
-                },
+                "start": {"dateTime": make_rfc3339(date_str, start_time), "timeZone": "Europe/Prague"},
+                "end": {"dateTime": make_rfc3339(date_str, end_time), "timeZone": "Europe/Prague"},
             }
-            if absence_status:
+            if change_info:
+                event_body["colorId"] = "6"  # Google Calendar: tangerine/oranžová
+            elif absence_status:
                 event_body["colorId"] = "11"
 
             try:
-                service.events().insert(
-                    calendarId=calendar_id,
-                    body=event_body,
-                ).execute()
+                service.events().insert(calendarId=calendar_id, body=event_body).execute()
                 inserted += 1
-
             except HttpError as error:
-                # 409 = už existuje, pak aktualizujeme
                 if error.resp.status != 409:
                     raise
-
-                service.events().update(
-                    calendarId=calendar_id,
-                    eventId=event_id,
-                    body=event_body,
-                ).execute()
+                service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
                 updated += 1
+
+            index += len(group)
 
     print(
         "Synchronizace úspěšně dokončena. "
-        f"Nové události: {inserted}, "
-        f"Aktualizované události: {updated}"
+        f"Nové události: {inserted}, Aktualizované události: {updated}, "
+        f"Odstraněné zrušené hodiny: {deleted}"
     )
 
 
