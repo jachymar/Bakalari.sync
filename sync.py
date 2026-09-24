@@ -1,6 +1,8 @@
 import os
 import json
 import hashlib
+import re
+import unicodedata
 import requests
 
 from datetime import datetime
@@ -13,6 +15,34 @@ from googleapiclient.errors import HttpError
 
 BAK_URL = os.getenv("BAK_URL", "https://gyarab.bakalari.cz").rstrip("/")
 BASE_URL = f"{BAK_URL}/api/3"
+ROOM_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "room_mapping.json")
+
+
+def normalize_room_name(value):
+    """Normalizuje názvy učeben pro porovnání různých variant."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+
+
+def load_room_mapping(path=ROOM_MAPPING_FILE):
+    """Načte upravitelnou mapu názvů učeben z JSON souboru."""
+    with open(path, encoding="utf-8") as mapping_file:
+        config = json.load(mapping_file)
+
+    mapping = {}
+    for room in config.get("rooms", []):
+        number = str(room["number"])
+        for alias in room.get("aliases", []):
+            normalized_alias = normalize_room_name(alias)
+            if normalized_alias:
+                mapping[normalized_alias] = number
+    return mapping
+
+
+def convert_room_name(room, room_mapping):
+    """Vrátí číslo učebny, nebo původní název, pokud v mapě není."""
+    return room_mapping.get(normalize_room_name(room), room)
 
 
 def get_bakalari_token(user, password):
@@ -158,6 +188,7 @@ def main():
     password = os.environ["BAK_PASS"]
     calendar_id = os.environ["CALENDAR_ID"]
     creds_dict = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+    room_mapping = load_room_mapping()
 
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict,
@@ -192,7 +223,9 @@ def main():
     }
 
     rooms = {
-        item["Id"]: item.get("Abbrev", item.get("Name", ""))
+        item["Id"]: convert_room_name(
+            item.get("Abbrev", item.get("Name", "")), room_mapping
+        )
         for item in data.get("Rooms", [])
         if item.get("Id") is not None
     }
