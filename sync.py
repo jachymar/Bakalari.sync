@@ -352,14 +352,21 @@ def build_event_summary(subject, room, title=None):
     return base_title
 
 
-def build_event_location(class_name, room):
-    """Vytvoří lokaci akce ve formátu 'třída - učebna'."""
+def build_event_location(class_name, room, room_name=None):
+    """Vytvoří lokaci akce: preferuje skutečný název učebny z Bakalářů, pak číslo učebny."""
     class_value = str(class_name or "").strip()
+    room_name = str(room_name or "").strip()
     room_value = str(room or "").strip()
 
-    if class_value and room_value:
-        return f"{class_value} - {room_value}"
-    return class_value or room_value
+    if room_name:
+        if room_value and room_name != room_value and room_value not in room_name:
+            return f"{room_name} - {room_value}"
+        return room_name
+
+    if room_value:
+        return room_value
+
+    return class_value
 
 
 def build_event_description(teacher_name=None, change_info="", absence_status=None, room_name=None, room_number=None):
@@ -769,7 +776,7 @@ def main():
             teacher_name = extract_teacher_name(first_atom, teachers)
 
             summary = build_event_summary(subject, room, title)
-            location = build_event_location(class_name, room)
+            location = build_event_location(class_name, room, room_name)
             description = build_event_description(
                 teacher_name=teacher_name,
                 change_info=change_info,

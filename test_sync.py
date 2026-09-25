@@ -65,7 +65,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(first_event_id, second_event_id)
         self.assertEqual(first_event_id, sync._event_id(today, "08:00", subject))
 
-    def test_event_title_contains_room_and_location_contains_class_name(self):
+    def test_event_title_contains_room_and_location_uses_real_room_name(self):
         atom = {
             "ClassId": 7,
             "Class": {"Name": "3.A"},
@@ -76,7 +76,8 @@ class SpecialEventGroupingTests(unittest.TestCase):
 
         self.assertEqual(sync.extract_class_name(atom, classes), "3.A")
         self.assertEqual(sync.build_event_summary("Matematika", "101"), "Matematika (101)")
-        self.assertEqual(sync.build_event_location("3.A", "101"), "3.A")
+        self.assertEqual(sync.build_event_location("3.A", "101", "A1"), "A1 - 101")
+        self.assertEqual(sync.build_event_location("3.A", "101"), "101")
 
     def test_event_description_omits_room_name_from_note(self):
         description = sync.build_event_description(
