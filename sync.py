@@ -252,10 +252,12 @@ def _change_description(atom):
     return ""
 
 
-def extract_teacher_name(atom):
+def extract_teacher_name(atom, teachers=None):
     """Vrátí jméno vyučujícího z dat hodiny, pokud je dostupné."""
     if not isinstance(atom, dict):
         return None
+
+    teachers = teachers or {}
 
     for key in (
         "Teacher",
@@ -285,6 +287,14 @@ def extract_teacher_name(atom):
             value = value.strip()
             if value:
                 return value
+
+    teacher_id = atom.get("TeacherId")
+    if teacher_id is not None:
+        teacher_name = teachers.get(teacher_id)
+        if isinstance(teacher_name, str):
+            teacher_name = teacher_name.strip()
+            if teacher_name:
+                return teacher_name
 
     return None
 
@@ -343,16 +353,20 @@ def build_event_summary(subject, room, title=None):
 
 
 def build_event_location(class_name, room):
-    """Vytvoří lokaci akce: preferuje jméno třídy, pak učebnu jako fallback."""
-    location = str(class_name or room or "").strip()
-    return location
+    """Vytvoří lokaci akce ve formátu 'třída - učebna'."""
+    class_value = str(class_name or "").strip()
+    room_value = str(room or "").strip()
+
+    if class_value and room_value:
+        return f"{class_value} - {room_value}"
+    return class_value or room_value
 
 
 def build_event_description(teacher_name=None, change_info="", absence_status=None, room_name=None, room_number=None):
     """Sestaví popis události bez duplicitní místnosti; lokace je uložena v poli location."""
     description_parts = []
     if teacher_name:
-        description_parts.append(teacher_name)
+        description_parts.append(f"Poznámka: {teacher_name}")
     elif not change_info:
         description_parts.append("Běžná hodina")
     if change_info:
@@ -666,6 +680,18 @@ def main():
         if item.get("Id") is not None
     }
 
+    teachers = {
+        item["Id"]: (
+            item.get("Name")
+            or item.get("FullName")
+            or item.get("DisplayName")
+            or item.get("Abbrev")
+            or ""
+        )
+        for item in data.get("Teachers", [])
+        if item.get("Id") is not None
+    }
+
     room_names = {
         item["Id"]: (item.get("Name") or item.get("Abbrev") or "")
         for item in data.get("Rooms", [])
@@ -740,7 +766,7 @@ def main():
             class_name = extract_class_name(first_atom, classes)
             change_info = _change_description(first_atom)
             absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
-            teacher_name = extract_teacher_name(first_atom)
+            teacher_name = extract_teacher_name(first_atom, teachers)
 
             summary = build_event_summary(subject, room, title)
             location = build_event_location(class_name, room)
