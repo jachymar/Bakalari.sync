@@ -289,6 +289,79 @@ def extract_teacher_name(atom):
     return None
 
 
+def extract_class_name(atom, classes=None):
+    """Vrátí jméno třídy z dat hodiny, pokud je dostupné."""
+    if not isinstance(atom, dict):
+        return None
+
+    if classes is None:
+        classes = {}
+
+    for key in (
+        "Class",
+        "ClassName",
+        "ClassTitle",
+        "ClassDisplayName",
+        "ClassLabel",
+    ):
+        value = atom.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("Name", "Abbrev", "ShortName", "DisplayName", "Title"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str):
+                    nested_value = nested_value.strip()
+                    if nested_value:
+                        return nested_value
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+
+    class_id = atom.get("ClassId")
+    if class_id is not None and class_id in classes:
+        class_name = classes[class_id]
+        if isinstance(class_name, str):
+            class_name = class_name.strip()
+            if class_name:
+                return class_name
+
+    return None
+
+
+def build_event_summary(subject, room, title=None):
+    """Vytvoří název akce s číslem učebny v závorkách."""
+    room_value = str(room or "").strip()
+    base_title = str(title or subject or "").strip()
+
+    if not base_title:
+        return room_value or ""
+
+    if room_value and f"({room_value})" not in base_title:
+        return f"{base_title} ({room_value})"
+
+    return base_title
+
+
+def build_event_location(class_name, room):
+    """Vytvoří lokaci akce: preferuje jméno třídy, pak učebnu jako fallback."""
+    location = str(class_name or room or "").strip()
+    return location
+
+
+def build_event_description(teacher_name=None, change_info="", absence_status=None, room_name=None, room_number=None):
+    """Sestaví popis události bez duplicitní místnosti; lokace je uložena v poli location."""
+    description_parts = []
+    if teacher_name:
+        description_parts.append(teacher_name)
+    elif not change_info:
+        description_parts.append("Běžná hodina")
+    if change_info:
+        description_parts.append(f"Změna/Suplování: {change_info}")
+    if absence_status:
+        description_parts.append(f"Absence: {absence_status}")
+    return "\n".join(description_parts)
+
+
 def _event_id(date_str, start_time, subject):
     normalized_subject = str(subject or "").strip()
     normalized_subject = re.sub(r"\s*\([^)]*\)\s*$", "", normalized_subject)
@@ -587,6 +660,18 @@ def main():
         if item.get("Id") is not None
     }
 
+    classes = {
+        item["Id"]: item.get("Abbrev", item.get("Name", ""))
+        for item in data.get("Classes", [])
+        if item.get("Id") is not None
+    }
+
+    room_names = {
+        item["Id"]: (item.get("Name") or item.get("Abbrev") or "")
+        for item in data.get("Rooms", [])
+        if item.get("Id") is not None
+    }
+
     rooms = {
         item["Id"]: convert_room_name(
             item.get("Abbrev", item.get("Name", "")), room_mapping
@@ -651,26 +736,27 @@ def main():
 
             first_atom = group[0][0]
             room = rooms.get(first_atom.get("RoomId"), "")
+            room_name = room_names.get(first_atom.get("RoomId"), room)
+            class_name = extract_class_name(first_atom, classes)
             change_info = _change_description(first_atom)
             absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
-            description_parts = []
             teacher_name = extract_teacher_name(first_atom)
-            if teacher_name:
-                description_parts.append(f"Vyučuje: {teacher_name}")
-            elif not change_info:
-                description_parts.append("Běžná hodina")
-            if change_info:
-                description_parts.append(f"Změna/Suplování: {change_info}")
-            if absence_status:
-                description_parts.append(f"Absence: {absence_status}")
 
-            summary = title or (f"{subject} ({room})" if room else subject)
+            summary = build_event_summary(subject, room, title)
+            location = build_event_location(class_name, room)
+            description = build_event_description(
+                teacher_name=teacher_name,
+                change_info=change_info,
+                absence_status=absence_status,
+                room_name=room_name,
+                room_number=room,
+            )
             event_id = _event_id(date_str, start_time, subject)
             event_body = {
                 "id": event_id,
                 "summary": summary,
-                "description": "\n".join(description_parts),
-                "location": room,
+                "description": description,
+                "location": location,
                 "start": {"dateTime": make_rfc3339(date_str, start_time), "timeZone": "Europe/Prague"},
                 "end": {"dateTime": make_rfc3339(date_str, end_time), "timeZone": "Europe/Prague"},
             }

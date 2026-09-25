@@ -65,6 +65,32 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(first_event_id, second_event_id)
         self.assertEqual(first_event_id, sync._event_id(today, "08:00", subject))
 
+    def test_event_title_contains_room_and_location_contains_class_name(self):
+        atom = {
+            "ClassId": 7,
+            "Class": {"Name": "3.A"},
+            "RoomId": 5,
+        }
+        room_mapping = {"c 101": "101"}
+        classes = {7: "3.A"}
+
+        self.assertEqual(sync.extract_class_name(atom, classes), "3.A")
+        self.assertEqual(sync.build_event_summary("Matematika", "101"), "Matematika (101)")
+        self.assertEqual(sync.build_event_location("3.A", "101"), "3.A")
+
+    def test_event_description_omits_room_name_from_note(self):
+        description = sync.build_event_description(
+            teacher_name="Mgr. Nováková",
+            change_info="",
+            absence_status=None,
+            room_name="Učebna 1D",
+            room_number="101",
+        )
+
+        self.assertIn("Mgr. Nováková", description)
+        self.assertNotIn("Vyučuje:", description)
+        self.assertNotIn("Učebna:", description)
+
     def test_extract_teacher_name_prefers_teacher_data(self):
         atom = {
             "Teacher": {"Name": "Mgr. Nováková"},
