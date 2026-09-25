@@ -89,6 +89,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         )
 
         self.assertIn("Mgr. Nováková", description)
+        self.assertNotIn("Poznámka:", description)
         self.assertNotIn("Vyučuje:", description)
         self.assertNotIn("Učebna:", description)
 

@@ -373,7 +373,7 @@ def build_event_description(teacher_name=None, change_info="", absence_status=No
     """Sestaví popis události bez duplicitní místnosti; lokace je uložena v poli location."""
     description_parts = []
     if teacher_name:
-        description_parts.append(f"Poznámka: {teacher_name}")
+        description_parts.append(teacher_name)
     elif not change_info:
         description_parts.append("Běžná hodina")
     if change_info:
