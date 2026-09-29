@@ -26,16 +26,58 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))
 
     def test_next_week_uses_permanent_calendar(self):
-        future_date = (sync.datetime.now(sync.ZoneInfo("Europe/Prague")) + sync.timedelta(days=8)).strftime("%Y-%m-%d")
+        reference_date = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
         self.assertEqual(
-            sync.select_calendar_id(future_date, "current-calendar", "permanent-calendar"),
+            sync.select_calendar_id("2026-10-05", "current-calendar", "permanent-calendar", reference_date),
             "permanent-calendar",
         )
-        today_date = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
         self.assertEqual(
-            sync.select_calendar_id(today_date, "current-calendar", "permanent-calendar"),
+            sync.select_calendar_id("2026-10-04", "current-calendar", "permanent-calendar", reference_date),
             "current-calendar",
         )
+
+    def test_week_window_rolls_over_on_monday(self):
+        sunday = sync.datetime.strptime("2026-10-04", "%Y-%m-%d").date()
+        monday = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
+
+        self.assertEqual(sync.week_window(sunday), (sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(), sync.datetime.strptime("2026-10-12", "%Y-%m-%d").date()))
+        self.assertEqual(sync.week_window(monday), (monday, sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()))
+
+    def test_expired_event_cleanup_only_deletes_managed_events(self):
+        class FakeRequest:
+            def __init__(self, result):
+                self.result = result
+
+            def execute(self):
+                return self.result
+
+        class FakeEvents:
+            def __init__(self):
+                self.deleted = []
+
+            def list(self, **kwargs):
+                return FakeRequest({
+                    "items": [
+                        {"id": "0123456789abcdef0123456789abcdef"},
+                        {"id": "personal-event"},
+                    ]
+                })
+
+            def delete(self, **kwargs):
+                self.deleted.append(kwargs)
+                return FakeRequest({})
+
+        events = FakeEvents()
+
+        class FakeService:
+            def events(self):
+                return events
+
+        week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
+        deleted = sync.delete_expired_events(FakeService(), ["calendar"], week_start)
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(events.deleted, [{"calendarId": "calendar", "eventId": "0123456789abcdef0123456789abcdef"}])
 
     def test_should_sync_20_minutes_after_lesson_starts(self):
         base_zone = sync.ZoneInfo("Europe/Prague")

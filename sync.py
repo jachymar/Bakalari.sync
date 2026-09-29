@@ -422,8 +422,16 @@ def execute_with_backoff(request, attempts=6):
     raise RuntimeError("Google Calendar request failed without a result.")
 
 
-def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id):
-    """Vybere kalendář: aktuální pro blízké dny, permanent pro další týden."""
+def week_window(reference_date=None):
+    """Vrátí pondělí aktuálního týdne a pondělí po následujícím týdnu."""
+    if reference_date is None:
+        reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
+    week_start = reference_date - timedelta(days=reference_date.weekday())
+    return week_start, week_start + timedelta(days=14)
+
+
+def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id, reference_date=None):
+    """Vybere kalendář pro aktuální nebo následující kalendářní týden."""
     if not current_calendar_id:
         return permanent_calendar_id
     if not permanent_calendar_id:
@@ -434,8 +442,8 @@ def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id):
     except ValueError:
         return current_calendar_id
 
-    today = datetime.now(ZoneInfo("Europe/Prague")).date()
-    if event_date >= today + timedelta(days=7):
+    week_start, _ = week_window(reference_date)
+    if event_date >= week_start + timedelta(days=7):
         return permanent_calendar_id
     return current_calendar_id
 
@@ -488,6 +496,40 @@ def _delete_event(service, calendar_id, event_id):
     except HttpError as error:
         if error.resp.status != 404:
             raise
+
+
+def delete_expired_events(service, calendar_ids, week_start):
+    """Odstraní události tohoto synchronizátoru před začátkem aktuálního týdne."""
+    time_max = datetime.combine(
+        week_start,
+        datetime.min.time(),
+        tzinfo=ZoneInfo("Europe/Prague"),
+    ).isoformat()
+    deleted = 0
+
+    for calendar_id in dict.fromkeys(calendar_id for calendar_id in calendar_ids if calendar_id):
+        page_token = None
+        while True:
+            response = execute_with_backoff(
+                service.events().list(
+                    calendarId=calendar_id,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    maxResults=250,
+                    pageToken=page_token,
+                )
+            )
+            for event in response.get("items", []):
+                event_id = event.get("id", "")
+                if re.fullmatch(r"[0-9a-f]{32}", event_id):
+                    _delete_event(service, calendar_id, event_id)
+                    deleted += 1
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    return deleted
 
 
 def build_timetable_urls(date_str):
@@ -584,7 +626,7 @@ def merge_timetable_data(base_data, extra_data):
     if not extra_data:
         return base_data
 
-    for key in ("Days", "Hours", "Subjects", "Rooms"):
+    for key in ("Days", "Hours", "Subjects", "Rooms", "Classes", "Teachers"):
         extra_items = extra_data.get(key, [])
         if not isinstance(extra_items, list):
             continue
@@ -642,11 +684,17 @@ def main():
     )
     service = build("calendar", "v3", credentials=credentials)
 
+    today = datetime.now(ZoneInfo("Europe/Prague")).date()
+    monday, window_end = week_window(today)
+    expired_deleted = delete_expired_events(
+        service,
+        (current_calendar_id, permanent_calendar_id),
+        monday,
+    )
+
     token = get_bakalari_token(user, password)
     headers = {"Authorization": f"Bearer {token}"}
 
-    today = datetime.now(ZoneInfo("Europe/Prague")).date()
-    monday = today - timedelta(days=today.weekday())
     data = fetch_timetable_for_date(headers, monday.isoformat())
     if data is None:
         response = requests.get(
@@ -662,7 +710,7 @@ def main():
     if next_data is not None:
         data = merge_timetable_data(data, next_data)
 
-    if not should_sync_now(data):
+    if not should_sync_now(data) and os.environ.get("FORCE_SYNC", "").lower() != "true":
         print("Synchronizace přeskočena: není 20 minut po začátku vyučovací hodiny.")
         return
 
@@ -735,6 +783,8 @@ def main():
 
     for day in data.get("Days", []):
         date_str = day.get("Date", "")[:10]
+        if not monday.isoformat() <= date_str < window_end.isoformat():
+            continue
         if is_day_cancelled(day):
             continue
 
@@ -753,7 +803,9 @@ def main():
             atom, subject, hour_info = atoms[index]
             start_time, _ = hour_info
             title = _special_title(atom, subject)
-            target_calendar_id = select_calendar_id(date_str, current_calendar_id, permanent_calendar_id)
+            target_calendar_id = select_calendar_id(
+                date_str, current_calendar_id, permanent_calendar_id, today
+            )
 
             if _is_cancelled(atom, subject):
                 _delete_event(service, target_calendar_id, _event_id(date_str, start_time, subject))
@@ -819,7 +871,8 @@ def main():
     print(
         "Synchronizace úspěšně dokončena. "
         f"Nové události: {inserted}, Aktualizované události: {updated}, "
-        f"Odstraněné zrušené hodiny: {deleted}"
+        f"Odstraněné zrušené hodiny: {deleted}, "
+        f"Odstraněné události minulých týdnů: {expired_deleted}"
     )
 
 
