@@ -7,8 +7,13 @@ name: Sync Bakalari Calendar
 # - ručně lze spustit i přes workflow_dispatch
 on:
   schedule:
-    - cron: '*/5 * * * 1-5'
-    - cron: '0 22,23 * * 0'
+    # Přes den se spustí každé 2 hodiny (v 17. minutě)
+    # Odpovídá přibližně 8:17 až 20:17 našeho času (zápis je v UTC)
+    - cron: '17 6-18/2 * * *'
+    
+    # V noci se spustí méně často (např. kolem půlnoci a ve 4 ráno)
+    - cron: '17 22,2 * * *'
+
   workflow_dispatch:
 
 concurrency:
