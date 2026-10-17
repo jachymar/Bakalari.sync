@@ -21,7 +21,7 @@ CANCELLED_WORDS = (
     "zrus",
     "cancel",
     "odpad",
-    "removed",
+    "r"removed",emoved",
     "vyjmut",
     "volno",
 )
@@ -561,9 +561,57 @@ def _delete_event(service, calendar_id, event_id):
         )
         return True
     except HttpError as error:
-        if error.resp.status != 404:
+        if error.resp.status not in (404, 410):
             raise
         return False
+
+
+def upsert_event(service, calendar_id, event_body):
+    """Vloží nebo aktualizuje událost a ošetří případ, kdy byla dříve smazána (HTTP 409/410)."""
+    body_with_status = {**event_body, "status": "confirmed"}
+    event_id = body_with_status["id"]
+    try:
+        execute_with_backoff(
+            service.events().insert(calendarId=calendar_id, body=body_with_status)
+        )
+        return "inserted", event_id
+    except HttpError as error:
+        if error.resp.status != 409:
+            raise
+        try:
+            execute_with_backoff(
+                service.events().update(
+                    calendarId=calendar_id,
+                    eventId=event_id,
+                    body=body_with_status,
+                )
+            )
+            return "updated", event_id
+        except HttpError as update_error:
+            if update_error.resp.status not in (404, 410):
+                raise
+            fallback_id = hashlib.md5(
+                f"{event_id}_restored".encode("utf-8")
+            ).hexdigest()
+            fallback_body = {**body_with_status, "id": fallback_id}
+            try:
+                execute_with_backoff(
+                    service.events().insert(
+                        calendarId=calendar_id, body=fallback_body
+                    )
+                )
+                return "inserted", fallback_id
+            except HttpError as fallback_error:
+                if fallback_error.resp.status != 409:
+                    raise
+                execute_with_backoff(
+                    service.events().update(
+                        calendarId=calendar_id,
+                        eventId=fallback_id,
+                        body=fallback_body,
+                    )
+                )
+                return "updated", fallback_id
 
 
 def delete_expired_events(service, calendar_ids, week_start):
@@ -990,9 +1038,6 @@ def main():
             )
 
             event_id = _event_id(date_str, start_time, subject)
-            active_events_by_calendar.setdefault(target_calendar_id, set()).add(
-                event_id
-            )
 
             event_body = {
                 "id": event_id,
@@ -1012,23 +1057,15 @@ def main():
             if color_id is not None:
                 event_body["colorId"] = color_id
 
-            try:
-                execute_with_backoff(
-                    service.events().insert(
-                        calendarId=target_calendar_id, body=event_body
-                    )
-                )
+            action, final_event_id = upsert_event(
+                service, target_calendar_id, event_body
+            )
+            active_events_by_calendar.setdefault(target_calendar_id, set()).add(
+                final_event_id
+            )
+            if action == "inserted":
                 inserted += 1
-            except HttpError as error:
-                if error.resp.status != 409:
-                    raise
-                execute_with_backoff(
-                    service.events().update(
-                        calendarId=target_calendar_id,
-                        eventId=event_id,
-                        body=event_body,
-                    )
-                )
+            else:
                 updated += 1
 
             index = next_index
