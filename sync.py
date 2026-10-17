@@ -447,11 +447,22 @@ def execute_with_backoff(request, attempts=6):
 
 
 def week_window(reference_date=None):
-    """Vrátí pondělí aktuálního týdne a pondělí po následujícím týdnu."""
+    """Vrátí pondělí aktuálního týdne a konec synchronizovaného okna (od pátku 2 týdny dopředu)."""
     if reference_date is None:
         reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
     week_start = reference_date - timedelta(days=reference_date.weekday())
-    return week_start, week_start + timedelta(days=14)
+    days_ahead = 21 if reference_date.weekday() >= 4 else 14
+    return week_start, week_start + timedelta(days=days_ahead)
+
+
+def cleanup_cutoff_date(reference_date=None):
+    """Vrátí datum, před kterým se mažou staré týdny (předchozí týden se maže až v pátek)."""
+    if reference_date is None:
+        reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
+    week_start = reference_date - timedelta(days=reference_date.weekday())
+    if reference_date.weekday() >= 4:
+        return week_start
+    return week_start - timedelta(days=7)
 
 
 def select_calendar_id(
@@ -813,10 +824,11 @@ def main():
 
     today = datetime.now(ZoneInfo("Europe/Prague")).date()
     monday, window_end = week_window(today)
+    cleanup_before = cleanup_cutoff_date(today)
     expired_deleted = delete_expired_events(
         service,
         (current_calendar_id, permanent_calendar_id),
-        monday,
+        cleanup_before,
     )
 
     token = get_bakalari_token(user, password)
@@ -832,10 +844,12 @@ def main():
         response.raise_for_status()
         data = response.json()
 
-    next_week = monday + timedelta(days=7)
-    next_data = fetch_timetable_for_date(headers, next_week.isoformat())
-    if next_data is not None:
-        data = merge_timetable_data(data, next_data)
+    week_cursor = monday + timedelta(days=7)
+    while week_cursor < window_end:
+        next_data = fetch_timetable_for_date(headers, week_cursor.isoformat())
+        if next_data is not None:
+            data = merge_timetable_data(data, next_data)
+        week_cursor += timedelta(days=7)
 
     if (
         os.environ.get("RESPECT_20MIN_RULE", "").lower() == "true"
