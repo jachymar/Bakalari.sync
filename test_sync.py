@@ -58,11 +58,15 @@ class SpecialEventGroupingTests(unittest.TestCase):
         )
 
     def test_week_window_rolls_over_on_monday(self):
+        thursday = sync.datetime.strptime("2026-10-01", "%Y-%m-%d").date()
+        friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
         sunday = sync.datetime.strptime("2026-10-04", "%Y-%m-%d").date()
         monday = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
+        next_friday = sync.datetime.strptime("2026-10-09", "%Y-%m-%d").date()
 
+        # Pondělí až čtvrtek: generuje se aktuální + příští týden (14 dní)
         self.assertEqual(
-            sync.week_window(sunday),
+            sync.week_window(thursday),
             (
                 sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
                 sync.datetime.strptime("2026-10-12", "%Y-%m-%d").date(),
@@ -74,6 +78,32 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 monday,
                 sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
             ),
+        )
+
+        # Pátek až neděle: generuje se aktuální + 2 týdny dopředu (21 dní)
+        self.assertEqual(
+            sync.week_window(friday),
+            (
+                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
+                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
+            ),
+        )
+        self.assertEqual(
+            sync.week_window(sunday),
+            (
+                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
+                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
+            ),
+        )
+
+        # Mazání předchozího týdne: od pondělí do čtvrtka zůstává minulý týden, smaže se až v pátek
+        self.assertEqual(
+            sync.cleanup_cutoff_date(monday),
+            sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
+        )
+        self.assertEqual(
+            sync.cleanup_cutoff_date(next_friday),
+            sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date(),
         )
 
     def test_expired_event_cleanup_only_deletes_managed_events(self):
