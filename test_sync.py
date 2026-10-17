@@ -25,8 +25,29 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertTrue(sync.is_day_cancelled({"Name": "Svátek"}))
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))
 
+    def test_cancelled_atom_detection_handles_bakalari_change_types(self):
+        self.assertTrue(
+            sync._is_cancelled(
+                {"SubjectId": None, "Change": {"ChangeType": "Canceled", "Description": "Vyjmuto z rozvrhu"}},
+                "Hodina",
+            )
+        )
+        self.assertTrue(
+            sync._is_cancelled(
+                {"SubjectId": None, "Change": {"ChangeType": "Removed", "TypeAbbrev": "Zruš"}},
+                "Hodina",
+            )
+        )
+        self.assertFalse(
+            sync._is_cancelled(
+                {"SubjectId": 5, "Change": {"ChangeType": "RoomChanged", "Description": "Přesun do učebny 102"}},
+                "Matematika",
+            )
+        )
+
     def test_next_week_uses_permanent_calendar(self):
         reference_date = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
+
         self.assertEqual(
             sync.select_calendar_id("2026-10-05", "current-calendar", "permanent-calendar", reference_date),
             "permanent-calendar",
@@ -40,8 +61,20 @@ class SpecialEventGroupingTests(unittest.TestCase):
         sunday = sync.datetime.strptime("2026-10-04", "%Y-%m-%d").date()
         monday = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
 
-        self.assertEqual(sync.week_window(sunday), (sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(), sync.datetime.strptime("2026-10-12", "%Y-%m-%d").date()))
-        self.assertEqual(sync.week_window(monday), (monday, sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()))
+        self.assertEqual(
+            sync.week_window(sunday),
+            (
+                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
+                sync.datetime.strptime("2026-10-12", "%Y-%m-%d").date(),
+            ),
+        )
+        self.assertEqual(
+            sync.week_window(monday),
+            (
+                monday,
+                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
+            ),
+        )
 
     def test_expired_event_cleanup_only_deletes_managed_events(self):
         class FakeRequest:
@@ -79,10 +112,56 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(deleted, 1)
         self.assertEqual(events.deleted, [{"calendarId": "calendar", "eventId": "0123456789abcdef0123456789abcdef"}])
 
+    def test_stale_window_cleanup_deletes_cancelled_or_replaced_events(self):
+        class FakeRequest:
+            def __init__(self, result):
+                self.result = result
+
+            def execute(self):
+                return self.result
+
+        class FakeEvents:
+            def __init__(self):
+                self.deleted = []
+
+            def list(self, **kwargs):
+                return FakeRequest({
+                    "items": [
+                        {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                        {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                        {"id": "personal-event"},
+                    ]
+                })
+
+            def delete(self, **kwargs):
+                self.deleted.append(kwargs)
+                return FakeRequest({})
+
+        events = FakeEvents()
+
+        class FakeService:
+            def events(self):
+                return events
+
+        week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
+        window_end = sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()
+        active_by_cal = {"calendar": {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+
+        deleted = sync.delete_stale_window_events(
+            FakeService(), ["calendar"], week_start, window_end, active_by_cal
+        )
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(
+            events.deleted,
+            [{"calendarId": "calendar", "eventId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+        )
+
     def test_should_sync_20_minutes_after_lesson_starts(self):
         base_zone = sync.ZoneInfo("Europe/Prague")
         today = sync.datetime.now(base_zone)
         today_str = today.strftime("%Y-%m-%d")
+
         lesson_starts = {
             "Days": [
                 {
@@ -94,18 +173,20 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 }
             ]
         }
+
         self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=20, second=0, microsecond=0).isoformat()))
         self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=25, second=0, microsecond=0).isoformat()))
         self.assertFalse(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=0, second=0, microsecond=0).isoformat()))
         self.assertFalse(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=15, second=0, microsecond=0).isoformat()))
 
-    def test_event_id_is_stable_when_summary_changes(self):
+    def test_event_id_is_stable_when_summary_or_subject_changes(self):
         today = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
-        subject = "Matematika"
         first_event_id = sync._event_id(today, "08:00", "Matematika (A101)")
-        second_event_id = sync._event_id(today, "08:00", "Matematika (A102)")
+        second_event_id = sync._event_id(today, "08:00", "Český jazyk (A102)")
+        cancelled_event_id = sync._event_id(today, "08:00", "Hodina")
+
         self.assertEqual(first_event_id, second_event_id)
-        self.assertEqual(first_event_id, sync._event_id(today, "08:00", subject))
+        self.assertEqual(first_event_id, cancelled_event_id)
 
     def test_event_title_contains_room_and_location_uses_real_room_name(self):
         atom = {
@@ -113,7 +194,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "Class": {"Name": "3.A"},
             "RoomId": 5,
         }
-        room_mapping = {"c 101": "101"}
         classes = {7: "3.A"}
 
         self.assertEqual(sync.extract_class_name(atom, classes), "3.A")
@@ -123,24 +203,25 @@ class SpecialEventGroupingTests(unittest.TestCase):
 
     def test_event_description_omits_room_name_from_note(self):
         description = sync.build_event_description(
-            teacher_name="Mgr. Nováková",
+            teacher_name="Mgr. Novák",
             change_info="",
             absence_status=None,
             room_name="Učebna 1D",
             room_number="101",
         )
 
-        self.assertIn("Mgr. Nováková", description)
+        self.assertIn("Mgr. Novák", description)
         self.assertNotIn("Poznámka:", description)
         self.assertNotIn("Vyučuje:", description)
         self.assertNotIn("Učebna:", description)
 
     def test_extract_teacher_name_prefers_teacher_data(self):
         atom = {
-            "Teacher": {"Name": "Mgr. Nováková"},
+            "Teacher": {"Name": "Mgr. Novák"},
             "RoomId": 5,
         }
-        self.assertEqual(sync.extract_teacher_name(atom), "Mgr. Nováková")
+
+        self.assertEqual(sync.extract_teacher_name(atom), "Mgr. Novák")
         self.assertEqual(sync.extract_teacher_name({"Teacher": "Pavel Horák"}), "Pavel Horák")
         self.assertIsNone(sync.extract_teacher_name({}))
 
