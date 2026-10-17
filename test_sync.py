@@ -275,6 +275,72 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(sleep_mock.call_count, 2)
 
+    def test_delete_event_ignores_410_already_deleted(self):
+        class FakeRequest:
+            def execute(self):
+                raise sync.HttpError(
+                    type("Resp", (), {"status": 410, "reason": "Gone"})(),
+                    b'{"error": {"message": "Resource has been deleted"}}',
+                )
+
+        class FakeEvents:
+            def delete(self, **kwargs):
+                return FakeRequest()
+
+        class FakeService:
+            def events(self):
+                return FakeEvents()
+
+        self.assertFalse(sync._delete_event(FakeService(), "calendar", "0123456789abcdef0123456789abcdef"))
+
+    def test_upsert_event_handles_409_and_410_deleted_resource(self):
+        class FakeRequest:
+            def __init__(self, fn):
+                self.fn = fn
+
+            def execute(self):
+                return self.fn()
+
+        class FakeEvents:
+            def __init__(self):
+                self.inserted_bodies = []
+
+            def insert(self, calendarId, body):
+                def _run():
+                    if body["id"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":
+                        raise sync.HttpError(
+                            type("Resp", (), {"status": 409, "reason": "Conflict"})(),
+                            b'{"error": {"message": "Already exists"}}',
+                        )
+                    self.inserted_bodies.append(body)
+                    return body
+                return FakeRequest(_run)
+
+            def update(self, calendarId, eventId, body):
+                def _run():
+                    raise sync.HttpError(
+                        type("Resp", (), {"status": 410, "reason": "Gone"})(),
+                        b'{"error": {"message": "Resource has been deleted"}}',
+                    )
+                return FakeRequest(_run)
+
+        events = FakeEvents()
+
+        class FakeService:
+            def events(self):
+                return events
+
+        action, final_id = sync.upsert_event(
+            FakeService(),
+            "calendar",
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"},
+        )
+
+        self.assertEqual(action, "inserted")
+        self.assertNotEqual(final_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(len(final_id), 32)
+        self.assertEqual(events.inserted_bodies[0]["status"], "confirmed")
+
 
 if __name__ == "__main__":
     unittest.main()
