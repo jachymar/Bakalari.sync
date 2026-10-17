@@ -21,7 +21,7 @@ CANCELLED_WORDS = (
     "zrus",
     "cancel",
     "odpad",
-    "r"removed",emoved",
+    "removed",
     "vyjmut",
     "volno",
 )
