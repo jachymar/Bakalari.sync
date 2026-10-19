@@ -6,14 +6,8 @@ name: Sync Bakalari Calendar
 # - v neděli večer spustí obnovu týdnů kolem půlnoci v časovém pásmu Europe/Prague
 # - ručně lze spustit i přes workflow_dispatch
 on:
-  schedule:
-    # Přes den se spustí každé 2 hodiny (v 17. minutě)
-    # Odpovídá přibližně 8:17 až 20:17 našeho času (zápis je v UTC)
-    - cron: '17 6-18/2 * * *'
-    
-    # V noci se spustí méně často (např. kolem půlnoci a ve 4 ráno)
-    - cron: '17 22,2 * * *'
-
+  repository_dispatch:
+    types: [trigger-sync]
   workflow_dispatch:
 
 concurrency:
