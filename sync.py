@@ -923,9 +923,8 @@ def load_users_config():
     # 3. Způsob: Původní proměnné bez čísla (zpětná kompatibilita)
     legacy_user = os.environ.get("BAK_USER")
     legacy_pass = os.environ.get("BAK_PASS")
-    
+
     if legacy_user and legacy_pass:
-        # Přidáme původního uživatele, pokud už v seznamu náhodou není
         if not any(u.get("user") == legacy_user for u in users):
             users.append({
                 "user": legacy_user,
@@ -933,6 +932,12 @@ def load_users_config():
                 "current_calendar_id": os.environ.get("CALENDAR_ID") or os.environ.get("CURRENT_CALENDAR_ID"),
                 "permanent_calendar_id": os.environ.get("PERMANENT_CALENDAR_ID")
             })
+
+    if not users:
+        raise KeyError(
+            "Nebyl nalezen žádný uživatel k synchronizaci. "
+            "Nastavte USERS_JSON, BAK_USER_1..N nebo BAK_USER a BAK_PASS."
+        )
 
     return users
 
