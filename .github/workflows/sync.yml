@@ -1,39 +1,44 @@
-name: Sync Bakalari Calendar
+name: Bakalari to Google Calendar Sync
 
-# Synchronizace rozvrhu z Bakalářů probíhá přes GitHub Actions:
-# - každých 5 minut ve všední dny
-# - vnitřně script zkontroluje, zda právě uplynulo přesně 20 minut od začátku nějaké vyučovací hodiny
-# - v neděli večer spustí obnovu týdnů kolem půlnoci v časovém pásmu Europe/Prague
-# - ručně lze spustit i přes workflow_dispatch
 on:
-  repository_dispatch:
-    types: [trigger-sync]
-  workflow_dispatch:
-
-concurrency:
-  group: bakalari-calendar-sync
-  cancel-in-progress: false
+  schedule:
+    # Běží v pracovní dny každých 30 minut od 6:00 do 17:00 UTC (cca 7:00/8:00 až 18:00/19:00 v ČR)
+    - cron: '*/30 6-16 * * 1-5'
+    # Běží v neděli večer v 18:00 UTC pro včasné načtení rozvrhu na nový týden
+    - cron: '0 18 * * 0'
+  workflow_dispatch: # Umožňuje spustit synchronizaci ručně z rozhraní GitHubu
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run script
+      - name: Run timetable synchronization
         env:
-          BAK_USER: ${{ secrets.BAK_USER }}
-          BAK_PASS: ${{ secrets.BAK_PASS }}
-          BAK_URL: https://gyarab.bakalari.cz
-          CALENDAR_ID: ${{ secrets.CALENDAR_ID }}
-          PERMANENT_CALENDAR_ID: ${{ secrets.PERMANENT_CALENDAR_ID }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-          FORCE_SYNC: ${{ github.event_name != 'schedule' || github.event.schedule != '*/5 * * * 1-5' }}
+          # 1. Uživatel
+          BAK_USER_1: ${{ secrets.BAK_USER_1 }}
+          BAK_PASS_1: ${{ secrets.BAK_PASS_1 }}
+          CALENDAR_ID_1: ${{ secrets.CALENDAR_ID_1 }}
+          # 2. Uživatel
+          BAK_USER_2: ${{ secrets.BAK_USER_2 }}
+          BAK_PASS_2: ${{ secrets.BAK_PASS_2 }}
+          CALENDAR_ID_2: ${{ secrets.CALENDAR_ID_2 }}
+          # Globální nastavení (volitelné)
+          BAK_URL: "https://gyarab.bakalari.cz"
+          RESPECT_20MIN_RULE: "false"
         run: python sync.py
