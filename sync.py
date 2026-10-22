@@ -941,59 +941,7 @@ def load_users_config():
 
     return users
 
-    # Hledání číslovaných proměnných BAK_USER_1, BAK_USER_2, ...
-     numbered_indices = sorted(
-        {
-            int(match.group(1))
-            for key in env.keys()
-            for match in [re.fullmatch(r"BAK_USER_(\d+)", key)]
-            if match and env.get(key)
-        }
-    )
-    for idx in numbered_indices:
-        entry = {
-            "name": env.get(f"USER_NAME_{idx}") or env.get(f"BAK_USER_{idx}"),
-            "user": env.get(f"BAK_USER_{idx}"),
-            "password": env.get(f"BAK_PASS_{idx}"),
-            "current_calendar_id": env.get(f"CALENDAR_ID_{idx}")
-            or env.get(f"CURRENT_CALENDAR_ID_{idx}"),
-            "permanent_calendar_id": env.get(f"PERMANENT_CALENDAR_ID_{idx}"),
-            "bak_url": env.get(f"BAK_URL_{idx}") or default_bak_url,
-        }
-        users.append(
-            _normalize_user_entry(entry, index=idx, default_bak_url=default_bak_url)
-        )
-
-    # Zpětná kompatibilita se základním BAK_USER (pokud ještě není v seznamu)
-    if env.get("BAK_USER") and env.get("BAK_PASS"):
-        single_entry = _normalize_user_entry(
-            {
-                "name": env.get("USER_NAME") or env.get("BAK_USER"),
-                "user": env["BAK_USER"],
-                "password": env["BAK_PASS"],
-                "current_calendar_id": env.get("CALENDAR_ID")
-                or env.get("CURRENT_CALENDAR_ID"),
-                "permanent_calendar_id": env.get("PERMANENT_CALENDAR_ID"),
-                "bak_url": default_bak_url,
-            },
-            index=len(users) + 1,
-            default_bak_url=default_bak_url,
-        )
-        if not any(
-            u["user"] == single_entry["user"]
-            and u["current_calendar_id"] == single_entry["current_calendar_id"]
-            and u["permanent_calendar_id"] == single_entry["permanent_calendar_id"]
-            for u in users
-        ):
-            users.append(single_entry)
-
-    if not users:
-        raise KeyError(
-            "Nebyl nalezen žádný uživatel k synchronizaci. "
-            "Nastavte USERS_JSON, BAK_USER_1..N nebo BAK_USER a BAK_PASS."
-        )
-
-    return users
+    
 
 
 def sync_single_user(
