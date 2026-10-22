@@ -5,6 +5,7 @@ import random
 import re
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -25,7 +26,6 @@ CANCELLED_WORDS = (
     "vyjmut",
     "volno",
 )
-
 SPECIAL_EVENT_WORDS = (
     "exkurz",
     "výlet",
@@ -70,9 +70,11 @@ def convert_room_name(room, room_mapping):
     return room_mapping.get(normalize_room_name(room), room)
 
 
-def get_bakalari_token(user, password):
+def get_bakalari_token(user, password, bak_url=None):
+    """Získá přístupový token z Bakalářů pro konkrétního uživatele."""
+    target_url = (bak_url or BAK_URL).rstrip("/")
     response = requests.post(
-        f"{BAK_URL}/api/login",
+        f"{target_url}/api/login",
         data={
             "client_id": "ANDR",
             "grant_type": "password",
@@ -91,11 +93,9 @@ def get_bakalari_token(user, password):
 def normalize_time(value):
     if value is None:
         return None
-
     text = str(value).strip()
     if not text:
         return None
-
     # Bakaláři sometimes returns minutes since midnight, e.g. 465 -> 07:45
     if text.isdigit():
         total_minutes = int(text)
@@ -103,14 +103,11 @@ def normalize_time(value):
             hours, minutes = divmod(total_minutes, 60)
             return f"{hours:02d}:{minutes:02d}"
         return None
-
     if ":" not in text:
         return None
-
     parts = text.split(":")
     if len(parts) != 2:
         return None
-
     try:
         hours = int(parts[0])
         minutes = int(parts[1])
@@ -118,7 +115,6 @@ def normalize_time(value):
             return None
     except ValueError:
         return None
-
     return f"{hours:02d}:{minutes:02d}"
 
 
@@ -150,7 +146,6 @@ def make_rfc3339(date_str, time_str):
             f"Neplatný čas z Bakaláři API: {time_str!r} "
             f"(datum {date_str!r})"
         )
-
     local_dt = datetime.strptime(
         f"{date_str}T{normalized}",
         "%Y-%m-%dT%H:%M",
@@ -164,7 +159,6 @@ def _absence_status(item):
         value = item.get(key)
         if isinstance(value, bool):
             return "omluveno" if value else "neomluveno"
-
     value = item.get("Type") or item.get("TypeName") or item.get("Status")
     if isinstance(value, dict):
         value = value.get("Name") or value.get("Description") or value.get("Id")
@@ -182,7 +176,6 @@ def extract_absences(data):
         records = records.get("Items", records.get("Absences", []))
     if not isinstance(records, list):
         return result
-
     for item in records:
         if not isinstance(item, dict):
             continue
@@ -230,14 +223,12 @@ def _special_title(atom, subject):
     folded = text.casefold()
     if not any(word in folded for word in SPECIAL_EVENT_WORDS):
         return None
-
     change = atom.get("Change")
     candidates = []
     if isinstance(change, dict):
         candidates.extend(change.get(key) for key in ("Description", "Name", "TypeAbbrev"))
     candidates.extend(atom.get(key) for key in ("Description", "Name"))
     candidates.append(subject)
-
     for candidate in candidates:
         value = str(candidate or "").strip()
         if value and not any(word in value.casefold() for word in CANCELLED_WORDS):
@@ -248,7 +239,6 @@ def _special_title(atom, subject):
 def _is_cancelled(atom, subject):
     if not isinstance(atom, dict):
         return False
-
     change = atom.get("Change")
     if isinstance(change, dict):
         change_type = str(change.get("ChangeType") or "").strip().casefold()
@@ -256,7 +246,6 @@ def _is_cancelled(atom, subject):
             return True
         if atom.get("SubjectId") is None and not _special_title(atom, subject):
             return True
-
     text = _atom_text(atom, subject).casefold()
     return any(word in text for word in CANCELLED_WORDS)
 
@@ -277,7 +266,6 @@ def extract_teacher_name(atom, teachers=None):
     """Vrátí jméno vyučujícího z dat hodiny, pokud je dostupné."""
     if not isinstance(atom, dict):
         return None
-
     teachers = teachers or {}
 
     for key in (
@@ -324,7 +312,6 @@ def extract_class_name(atom, classes=None):
     """Vrátí jméno třídy z dat hodiny, pokud je dostupné."""
     if not isinstance(atom, dict):
         return None
-
     if classes is None:
         classes = {}
 
@@ -456,7 +443,7 @@ def week_window(reference_date=None):
 
 
 def cleanup_cutoff_date(reference_date=None):
-    """Vrátí datum, před kterým se mažou staré týdny (předchozí týden se maže až v pátek)."""
+    """Vrátí datum, před kterým se mažou staré týdny (předchozí týden se maže v pátek)."""
     if reference_date is None:
         reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
     week_start = reference_date - timedelta(days=reference_date.weekday())
@@ -512,7 +499,6 @@ def is_day_cancelled(day):
                 "holiday",
             }:
                 return True
-
     for key in ("Type", "TypeName", "Name", "DayType", "State", "DayDescription"):
         value = day.get(key)
         if isinstance(value, dict):
@@ -650,7 +636,7 @@ def delete_expired_events(service, calendar_ids, week_start):
 def delete_stale_window_events(
     service, calendar_ids, week_start, window_end, active_events_by_calendar
 ):
-    """Odstraní z kalendářů v okně 14 dnů všechny události skriptu, které už nejsou v rozvrhu."""
+    """Odstraní z kalendářů v okně 14 dnů všechny události skriptu, které nejsou v rozvrhu."""
     time_min = datetime.combine(
         week_start,
         datetime.min.time(),
@@ -661,7 +647,6 @@ def delete_stale_window_events(
         datetime.min.time(),
         tzinfo=ZoneInfo("Europe/Prague"),
     ).isoformat()
-
     deleted = 0
     for calendar_id in dict.fromkeys(
         calendar_id for calendar_id in calendar_ids if calendar_id
@@ -690,13 +675,14 @@ def delete_stale_window_events(
     return deleted
 
 
-def build_timetable_urls(date_str):
+def build_timetable_urls(date_str, base_url=None):
     """Vrátí pravděpodobné Bakaláři endpointy pro zvolený den / týden."""
+    target_base = (base_url or BASE_URL).rstrip("/")
     candidates = [
-        f"{BASE_URL}/timetable/actual?date={date_str}",
-        f"{BASE_URL}/timetable?date={date_str}",
-        f"{BASE_URL}/timetable/actual?day={date_str}",
-        f"{BASE_URL}/timetable/actual?from={date_str}&to={date_str}",
+        f"{target_base}/timetable/actual?date={date_str}",
+        f"{target_base}/timetable?date={date_str}",
+        f"{target_base}/timetable/actual?day={date_str}",
+        f"{target_base}/timetable/actual?from={date_str}&to={date_str}",
     ]
     if "-" in date_str:
         monday = datetime.strptime(date_str, "%Y-%m-%d").date() - timedelta(
@@ -705,16 +691,16 @@ def build_timetable_urls(date_str):
         sunday = monday + timedelta(days=6)
         candidates.extend(
             [
-                f"{BASE_URL}/timetable/actual?from={monday.isoformat()}&to={sunday.isoformat()}",
-                f"{BASE_URL}/timetable?from={monday.isoformat()}&to={sunday.isoformat()}",
+                f"{target_base}/timetable/actual?from={monday.isoformat()}&to={sunday.isoformat()}",
+                f"{target_base}/timetable?from={monday.isoformat()}&to={sunday.isoformat()}",
             ]
         )
     return list(dict.fromkeys(candidates))
 
 
-def fetch_timetable_for_date(headers, date_str):
+def fetch_timetable_for_date(headers, date_str, base_url=None):
     """Načte rozvrh pro den nebo týden z Bakalářů a vrátí JSON nebo None."""
-    for url in build_timetable_urls(date_str):
+    for url in build_timetable_urls(date_str, base_url=base_url):
         try:
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
@@ -791,7 +777,6 @@ def merge_timetable_data(base_data, extra_data):
     """Spojí rozvrhy z aktuálního a následujícího týdne do jednoho datasetu."""
     if not extra_data:
         return base_data
-
     for key in ("Days", "Hours", "Subjects", "Rooms", "Classes", "Teachers"):
         extra_items = extra_data.get(key, [])
         if not isinstance(extra_items, list):
@@ -800,7 +785,6 @@ def merge_timetable_data(base_data, extra_data):
         if not isinstance(base_items, list):
             base_items = []
             base_data[key] = base_items
-
         if key == "Days":
             seen = {
                 str(item.get("Date") or "")[:10]
@@ -840,7 +824,6 @@ def group_special_event_atoms(atoms, start_index):
     title = _special_title(atom, subject)
     if not title:
         return [(atom, subject, hour_info)], start_index + 1
-
     group = [(atom, subject, hour_info)]
     next_index = start_index + 1
     while next_index < len(atoms):
@@ -854,38 +837,191 @@ def group_special_event_atoms(atoms, start_index):
     return group, next_index
 
 
-def main():
-    user = os.environ["BAK_USER"]
-    password = os.environ["BAK_PASS"]
-    current_calendar_id = os.environ.get("CALENDAR_ID") or os.environ.get(
-        "CURRENT_CALENDAR_ID"
-    )
-    permanent_calendar_id = os.environ.get("PERMANENT_CALENDAR_ID")
-    creds_dict = json.loads(os.environ["GOOGLE_CREDS_JSON"])
-    room_mapping = load_room_mapping()
+def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
+    """Zvaliduje a sjednotí záznam jednoho uživatele pro synchronizaci."""
+    if not isinstance(raw_entry, dict):
+        raise ValueError(f"Konfigurace uživatele #{index} musí být objekt (dict).")
 
-    credentials = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/calendar"],
+    user = (
+        raw_entry.get("user")
+        or raw_entry.get("username")
+        or raw_entry.get("bak_user")
+        or raw_entry.get("BAK_USER")
     )
-    service = build("calendar", "v3", credentials=credentials)
+    password = (
+        raw_entry.get("password")
+        or raw_entry.get("pass")
+        or raw_entry.get("bak_pass")
+        or raw_entry.get("BAK_PASS")
+    )
+    current_cal = (
+        raw_entry.get("current_calendar_id")
+        or raw_entry.get("calendar_id")
+        or raw_entry.get("CALENDAR_ID")
+        or raw_entry.get("CURRENT_CALENDAR_ID")
+    )
+    permanent_cal = (
+        raw_entry.get("permanent_calendar_id")
+        or raw_entry.get("PERMANENT_CALENDAR_ID")
+    )
+    bak_url = (
+        raw_entry.get("bak_url")
+        or raw_entry.get("BAK_URL")
+        or default_bak_url
+        or BAK_URL
+    ).rstrip("/")
+    name = raw_entry.get("name") or str(user or f"user_{index}")
 
-    today = datetime.now(ZoneInfo("Europe/Prague")).date()
+    if not user or not password:
+        raise ValueError(
+            f"Uživatel '{name}' nemá vyplněné přihlašovací údaje (user/password)."
+        )
+    if not current_cal and not permanent_cal:
+        raise ValueError(
+            f"Uživatel '{name}' nemá nastavený žádný kalendář (calendar_id / permanent_calendar_id)."
+        )
+
+    return {
+        "name": str(name),
+        "user": str(user),
+        "password": str(password),
+        "current_calendar_id": str(current_cal) if current_cal else None,
+        "permanent_calendar_id": str(permanent_cal) if permanent_cal else None,
+        "bak_url": bak_url,
+    }
+
+
+def load_users_config(env=None):
+    """
+    Načte seznam uživatelů k synchronizaci z prostředí:
+    1) USERS_JSON / SYNC_USERS_JSON (JSON pole objektů nebo objekt {"users": [...]})
+    2) Číslované proměnné BAK_USER_1, BAK_PASS_1, CALENDAR_ID_1, ...
+    3) Klasické proměnné pro jednoho uživatele BAK_USER, BAK_PASS, CALENDAR_ID...
+    """
+    if env is None:
+        env = os.environ
+
+    default_bak_url = env.get("BAK_URL", BAK_URL).rstrip("/")
+    users = []
+
+    raw_json = env.get("USERS_JSON") or env.get("SYNC_USERS_JSON")
+    if raw_json and raw_json.strip():
+        parsed = json.loads(raw_json)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("users", [])
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("USERS_JSON musí obsahovat neprázdný seznam uživatelů.")
+        for idx, item in enumerate(parsed, start=1):
+            users.append(
+                _normalize_user_entry(item, index=idx, default_bak_url=default_bak_url)
+            )
+        return users
+
+    # Hledání číslovaných proměnných BAK_USER_1, BAK_USER_2, ...
+     numbered_indices = sorted(
+        {
+            int(match.group(1))
+            for key in env.keys()
+            for match in [re.fullmatch(r"BAK_USER_(\d+)", key)]
+            if match and env.get(key)
+        }
+    )
+    for idx in numbered_indices:
+        entry = {
+            "name": env.get(f"USER_NAME_{idx}") or env.get(f"BAK_USER_{idx}"),
+            "user": env.get(f"BAK_USER_{idx}"),
+            "password": env.get(f"BAK_PASS_{idx}"),
+            "current_calendar_id": env.get(f"CALENDAR_ID_{idx}")
+            or env.get(f"CURRENT_CALENDAR_ID_{idx}"),
+            "permanent_calendar_id": env.get(f"PERMANENT_CALENDAR_ID_{idx}"),
+            "bak_url": env.get(f"BAK_URL_{idx}") or default_bak_url,
+        }
+        users.append(
+            _normalize_user_entry(entry, index=idx, default_bak_url=default_bak_url)
+        )
+
+    # Zpětná kompatibilita se základním BAK_USER (pokud ještě není v seznamu)
+    if env.get("BAK_USER") and env.get("BAK_PASS"):
+        single_entry = _normalize_user_entry(
+            {
+                "name": env.get("USER_NAME") or env.get("BAK_USER"),
+                "user": env["BAK_USER"],
+                "password": env["BAK_PASS"],
+                "current_calendar_id": env.get("CALENDAR_ID")
+                or env.get("CURRENT_CALENDAR_ID"),
+                "permanent_calendar_id": env.get("PERMANENT_CALENDAR_ID"),
+                "bak_url": default_bak_url,
+            },
+            index=len(users) + 1,
+            default_bak_url=default_bak_url,
+        )
+        if not any(
+            u["user"] == single_entry["user"]
+            and u["current_calendar_id"] == single_entry["current_calendar_id"]
+            and u["permanent_calendar_id"] == single_entry["permanent_calendar_id"]
+            for u in users
+        ):
+            users.append(single_entry)
+
+    if not users:
+        raise KeyError(
+            "Nebyl nalezen žádný uživatel k synchronizaci. "
+            "Nastavte USERS_JSON, BAK_USER_1..N nebo BAK_USER a BAK_PASS."
+        )
+
+    return users
+
+
+def sync_single_user(
+    user_config,
+    creds_dict=None,
+    room_mapping=None,
+    service=None,
+    today=None,
+    env=None,
+):
+    """Synchronizuje rozvrh jednoho konkrétního uživatele do jeho Google Kalendáře."""
+    if env is None:
+        env = os.environ
+    if room_mapping is None:
+        room_mapping = load_room_mapping()
+    if service is None:
+        if creds_dict is None:
+            creds_dict = json.loads(env["GOOGLE_CREDS_JSON"])
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/calendar"],
+        )
+        service = build("calendar", "v3", credentials=credentials)
+
+    user_label = user_config.get("name") or user_config["user"]
+    user = user_config["user"]
+    password = user_config["password"]
+    current_calendar_id = user_config.get("current_calendar_id")
+    permanent_calendar_id = user_config.get("permanent_calendar_id")
+    user_bak_url = (user_config.get("bak_url") or BAK_URL).rstrip("/")
+    user_base_url = f"{user_bak_url}/api/3"
+
+    if today is None:
+        today = datetime.now(ZoneInfo("Europe/Prague")).date()
     monday, window_end = week_window(today)
     cleanup_before = cleanup_cutoff_date(today)
+
     expired_deleted = delete_expired_events(
         service,
         (current_calendar_id, permanent_calendar_id),
         cleanup_before,
     )
 
-    token = get_bakalari_token(user, password)
+    token = get_bakalari_token(user, password, bak_url=user_bak_url)
     headers = {"Authorization": f"Bearer {token}"}
 
-    data = fetch_timetable_for_date(headers, monday.isoformat())
+    data = fetch_timetable_for_date(
+        headers, monday.isoformat(), base_url=user_base_url
+    )
     if data is None:
         response = requests.get(
-            f"{BASE_URL}/timetable/actual",
+            f"{user_base_url}/timetable/actual",
             headers=headers,
             timeout=30,
         )
@@ -894,21 +1030,33 @@ def main():
 
     week_cursor = monday + timedelta(days=7)
     while week_cursor < window_end:
-        next_data = fetch_timetable_for_date(headers, week_cursor.isoformat())
+        next_data = fetch_timetable_for_date(
+            headers, week_cursor.isoformat(), base_url=user_base_url
+        )
         if next_data is not None:
             data = merge_timetable_data(data, next_data)
         week_cursor += timedelta(days=7)
 
     if (
-        os.environ.get("RESPECT_20MIN_RULE", "").lower() == "true"
+        env.get("RESPECT_20MIN_RULE", "").lower() == "true"
         and not should_sync_now(data)
-        and os.environ.get("FORCE_SYNC", "").lower() != "true"
+        and env.get("FORCE_SYNC", "").lower() != "true"
     ):
-        print("Synchronizace přeskočena: není 20 minut po začátku vyučovací hodiny.")
-        return
+        print(
+            f"[{user_label}] Synchronizace přeskočena: "
+            "není 20 minut po začátku vyučovací hodiny."
+        )
+        return {
+            "user": user_label,
+            "skipped": True,
+            "inserted": 0,
+            "updated": 0,
+            "deleted": 0,
+            "expired_deleted": expired_deleted,
+        }
 
     absence_response = requests.get(
-        f"{BASE_URL}/absence/student",
+        f"{user_base_url}/absence/student",
         headers=headers,
         timeout=30,
         verify=False,
@@ -949,7 +1097,6 @@ def main():
         for item in data.get("Rooms", [])
         if item.get("Id") is not None
     }
-
     hours = {}
     for item in data.get("Hours", []):
         hour_id = item.get("Id")
@@ -962,7 +1109,7 @@ def main():
     if not hours:
         sample = data.get("Hours", [])[:2]
         raise RuntimeError(
-            "API nevrátilo správné časy vyučovacích hodin. "
+            f"[{user_label}] API nevrátilo správné časy vyučovacích hodin. "
             f"Ukázka dat Hours: {sample}"
         )
 
@@ -977,17 +1124,14 @@ def main():
             continue
         if is_day_cancelled(day):
             continue
-
         atoms = []
         for atom in day.get("Atoms", []):
             subject = subjects.get(atom.get("SubjectId"), "Hodina")
             hour_info = hours.get(atom.get("HourId"))
             if hour_info:
                 atoms.append((atom, subject, hour_info))
-
         if not atoms:
             continue
-
         index = 0
         while index < len(atoms):
             atom, subject, hour_info = atoms[index]
@@ -996,7 +1140,6 @@ def main():
             target_calendar_id = select_calendar_id(
                 date_str, current_calendar_id, permanent_calendar_id, today
             )
-
             if _is_cancelled(atom, subject):
                 if _delete_event(
                     service,
@@ -1018,7 +1161,6 @@ def main():
                 end_time = max(hour_data[1] for _, _, hour_data in group)
             else:
                 end_time = hour_info[1]
-
             first_atom = group[0][0]
             room = rooms.get(first_atom.get("RoomId"), "")
             room_name = room_names.get(first_atom.get("RoomId"), room)
@@ -1067,7 +1209,6 @@ def main():
                 inserted += 1
             else:
                 updated += 1
-
             index = next_index
 
     deleted += delete_stale_window_events(
@@ -1079,11 +1220,76 @@ def main():
     )
 
     print(
-        "Synchronizace úspěšně dokončena. "
+        f"[{user_label}] Synchronizace úspěšně dokončena. "
         f"Nové události: {inserted}, Aktualizované události: {updated}, "
         f"Odstraněné zrušené hodiny: {deleted}, "
         f"Odstraněné události minulých týdnů: {expired_deleted}"
     )
+    return {
+        "user": user_label,
+        "skipped": False,
+        "inserted": inserted,
+        "updated": updated,
+        "deleted": deleted,
+        "expired_deleted": expired_deleted,
+    }
+
+
+def main():
+    """Hlavní vstupní bod: načte všechny uživatele a synchronizuje je paralelně."""
+    users = load_users_config()
+    creds_dict = json.loads(os.environ["GOOGLE_CREDS_JSON"])
+    room_mapping = load_room_mapping()
+    today = datetime.now(ZoneInfo("Europe/Prague")).date()
+
+    if len(users) == 1:
+        sync_single_user(
+            users[0],
+            creds_dict=creds_dict,
+            room_mapping=room_mapping,
+            today=today,
+        )
+        return
+
+    max_workers = min(len(users), int(os.environ.get("MAX_SYNC_WORKERS", "5")))
+    print(f"Spouštím současnou synchronizaci pro {len(users)} uživatelů...")
+
+    errors = []
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_user = {
+            executor.submit(
+                sync_single_user,
+                user_cfg,
+                creds_dict,
+                room_mapping,
+                None,
+                today,
+            ): user_cfg
+            for user_cfg in users
+        }
+        for future in as_completed(future_to_user):
+            user_cfg = future_to_user[future]
+            user_label = user_cfg.get("name") or user_cfg["user"]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"[{user_label}] Chyba při synchronizaci: {exc}")
+                errors.append((user_label, exc))
+
+    total_inserted = sum(r["inserted"] for r in results)
+    total_updated = sum(r["updated"] for r in results)
+    total_deleted = sum(r["deleted"] for r in results)
+    print(
+        f"Souhrn synchronizace ({len(results)}/{len(users)} úspěšných) — "
+        f"Vloženo: {total_inserted}, Aktualizováno: {total_updated}, Smazáno: {total_deleted}"
+    )
+
+    if errors:
+        failed_names = ", ".join(name for name, _ in errors)
+        raise RuntimeError(
+            f"Synchronizace selhala u {len(errors)} uživatelů: {failed_names}"
+        )
 
 
 if __name__ == "__main__":
