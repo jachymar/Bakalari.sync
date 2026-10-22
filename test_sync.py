@@ -34,7 +34,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         )
         self.assertTrue(
             sync._is_cancelled(
-                {"SubjectId": None, "Change": {"ChangeType": "Removed", "TypeAbbrev": "Zruš"}},
+                {"SubjectId": None, "Change": {"ChangeType": "Removed", "TypeAbbrev": "Zruš."}},
                 "Hodina",
             )
         )
@@ -79,7 +79,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
             ),
         )
-
         # Pátek až neděle: generuje se aktuální + 2 týdny dopředu (21 dní)
         self.assertEqual(
             sync.week_window(friday),
@@ -95,7 +94,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
             ),
         )
-
         # Mazání předchozího týdne: od pondělí do čtvrtka zůstává minulý týden, smaže se až v pátek
         self.assertEqual(
             sync.cleanup_cutoff_date(monday),
@@ -191,7 +189,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
         base_zone = sync.ZoneInfo("Europe/Prague")
         today = sync.datetime.now(base_zone)
         today_str = today.strftime("%Y-%m-%d")
-
         lesson_starts = {
             "Days": [
                 {
@@ -340,6 +337,60 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertNotEqual(final_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self.assertEqual(len(final_id), 32)
         self.assertEqual(events.inserted_bodies[0]["status"], "confirmed")
+
+    def test_load_users_config_supports_users_json_and_numbered_envs(self):
+        json_env = {
+            "USERS_JSON": """
+            [
+                {"name": "Petr", "user": "petr1", "password": "pw1", "calendar_id": "cal_petr"},
+                {"name": "Jana", "user": "jana2", "password": "pw2", "current_calendar_id": "cal_jana_cur", "permanent_calendar_id": "cal_jana_perm"}
+            ]
+            """
+        }
+        users_from_json = sync.load_users_config(json_env)
+        self.assertEqual(len(users_from_json), 2)
+        self.assertEqual(users_from_json[0]["name"], "Petr")
+        self.assertEqual(users_from_json[0]["current_calendar_id"], "cal_petr")
+        self.assertEqual(users_from_json[1]["permanent_calendar_id"], "cal_jana_perm")
+
+        numbered_env = {
+            "BAK_USER_1": "student1",
+            "BAK_PASS_1": "pass1",
+            "CALENDAR_ID_1": "cal1",
+            "BAK_USER_2": "student2",
+            "BAK_PASS_2": "pass2",
+            "CURRENT_CALENDAR_ID_2": "cal2_cur",
+            "PERMANENT_CALENDAR_ID_2": "cal2_perm",
+        }
+        users_numbered = sync.load_users_config(numbered_env)
+        self.assertEqual(len(users_numbered), 2)
+        self.assertEqual(users_numbered[0]["user"], "student1")
+        self.assertEqual(users_numbered[1]["user"], "student2")
+        self.assertEqual(users_numbered[1]["permanent_calendar_id"], "cal2_perm")
+
+    def test_main_synchronizes_multiple_users_concurrently(self):
+        env = {
+            "GOOGLE_CREDS_JSON": '{"type": "service_account"}',
+            "USERS_JSON": '[{"user": "u1", "password": "p1", "calendar_id": "c1"}, {"user": "u2", "password": "p2", "calendar_id": "c2"}]',
+        }
+        synced_users = []
+
+        def fake_sync_single(user_cfg, creds_dict=None, room_mapping=None, service=None, today=None):
+            synced_users.append(user_cfg["user"])
+            return {
+                "user": user_cfg["user"],
+                "skipped": False,
+                "inserted": 2,
+                "updated": 1,
+                "deleted": 0,
+                "expired_deleted": 0,
+            }
+
+        with mock.patch.dict(sync.os.environ, env, clear=True):
+            with mock.patch.object(sync, "sync_single_user", side_effect=fake_sync_single):
+                sync.main()
+
+        self.assertCountEqual(synced_users, ["u1", "u2"])
 
 
 if __name__ == "__main__":
