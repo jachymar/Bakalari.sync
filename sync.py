@@ -891,31 +891,50 @@ def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
     }
 
 
-def load_users_config(env=None):
-    """
-    Načte seznam uživatelů k synchronizaci z prostředí:
-    1) USERS_JSON / SYNC_USERS_JSON (JSON pole objektů nebo objekt {"users": [...]})
-    2) Číslované proměnné BAK_USER_1, BAK_PASS_1, CALENDAR_ID_1, ...
-    3) Klasické proměnné pro jednoho uživatele BAK_USER, BAK_PASS, CALENDAR_ID...
-    """
-    if env is None:
-        env = os.environ
-
-    default_bak_url = env.get("BAK_URL", BAK_URL).rstrip("/")
+def load_users_config():
+    """Načte konfiguraci uživatelů z proměnných prostředí."""
     users = []
 
-    raw_json = env.get("USERS_JSON") or env.get("SYNC_USERS_JSON")
-    if raw_json and raw_json.strip():
-        parsed = json.loads(raw_json)
-        if isinstance(parsed, dict):
-            parsed = parsed.get("users", [])
-        if not isinstance(parsed, list) or not parsed:
-            raise ValueError("USERS_JSON musí obsahovat neprázdný seznam uživatelů.")
-        for idx, item in enumerate(parsed, start=1):
-            users.append(
-                _normalize_user_entry(item, index=idx, default_bak_url=default_bak_url)
-            )
-        return users
+    # 1. Způsob: USERS_JSON (pokud je použit)
+    users_json = os.environ.get("USERS_JSON")
+    if users_json:
+        try:
+            users.extend(json.loads(users_json))
+        except json.JSONDecodeError:
+            print("Chyba: USERS_JSON nemá platný formát JSON.")
+
+    # 2. Způsob: Číslované proměnné (BAK_USER_1, BAK_USER_2, atd.)
+    numbered_indices = sorted(
+        int(k.split("_")[-1]) for k in os.environ.keys()
+        if k.startswith("BAK_USER_") and k.split("_")[-1].isdigit()
+    )
+
+    for i in numbered_indices:
+        user = os.environ.get(f"BAK_USER_{i}")
+        password = os.environ.get(f"BAK_PASS_{i}")
+        if user and password:
+            users.append({
+                "user": user,
+                "password": password,
+                "current_calendar_id": os.environ.get(f"CALENDAR_ID_{i}") or os.environ.get(f"CURRENT_CALENDAR_ID_{i}"),
+                "permanent_calendar_id": os.environ.get(f"PERMANENT_CALENDAR_ID_{i}")
+            })
+
+    # 3. Způsob: Původní proměnné bez čísla (zpětná kompatibilita)
+    legacy_user = os.environ.get("BAK_USER")
+    legacy_pass = os.environ.get("BAK_PASS")
+    
+    if legacy_user and legacy_pass:
+        # Přidáme původního uživatele, pokud už v seznamu náhodou není
+        if not any(u.get("user") == legacy_user for u in users):
+            users.append({
+                "user": legacy_user,
+                "password": legacy_pass,
+                "current_calendar_id": os.environ.get("CALENDAR_ID") or os.environ.get("CURRENT_CALENDAR_ID"),
+                "permanent_calendar_id": os.environ.get("PERMANENT_CALENDAR_ID")
+            })
+
+    return users
 
     # Hledání číslovaných proměnných BAK_USER_1, BAK_USER_2, ...
      numbered_indices = sorted(
