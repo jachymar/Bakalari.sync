@@ -1,11 +1,8 @@
 name: Bakalari to Google Calendar Sync
 
 on:
-  schedule:
-    # Běží v pracovní dny každých 30 minut od 6:00 do 17:00 UTC (cca 7:00/8:00 až 18:00/19:00 v ČR)
-    - cron: '*/30 6-16 * * 1-5'
-    # Běží v neděli večer v 18:00 UTC pro včasné načtení rozvrhu na nový týden
-    - cron: '0 18 * * 0'
+  repository_dispatch:
+    types: [trigger-sync]
   workflow_dispatch: # Umožňuje spustit synchronizaci ručně z rozhraní GitHubu
 
 jobs:
