@@ -533,8 +533,14 @@ def is_day_cancelled(day):
     return False
 
 
-def event_color_for(change_info, title):
+def event_color_for(change_info, title, absence_status=None):
     """Vrátí barvu Google kalendáře pro typ události."""
+    # Nastavení barvy pro absenci (pouze Google event ID barvy 1-11)
+    if absence_status:
+        # '4' je Flamingo (světle červená/lososová) s nádechem červené, 
+        # která není tak silně agresivní. Pro sytě červenou lze použít '11' (Tomato).
+        return "4"
+        
     if title:
         return "2"
     return None
@@ -1167,7 +1173,7 @@ def sync_single_user(
                     "timeZone": "Europe/Prague",
                 },
             }
-            color_id = event_color_for(change_info, title)
+            color_id = event_color_for(change_info, title, absence_status)
             if color_id is not None:
                 event_body["colorId"] = color_id
 
