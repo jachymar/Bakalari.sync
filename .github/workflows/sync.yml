@@ -1,71 +1,74 @@
 name: Bakalari to Google Calendar Sync
 
 on:
-repository_dispatch:
-types: [trigger-sync]
-workflow_dispatch: # Umožňuje spustit synchronizaci ručně z rozhraní GitHubu
-inputs:
-action_type:
-description: 'Vyber, jakou akci chceš provést'
-required: true
-default: 'sync'
-type: choice
-options:
-- sync (Běžná synchronizace)
-- clear (Smazat eventy z kalendáře)
-- dump (Stáhnout data pro analýzu absencí)
+  repository_dispatch:
+    types: [trigger-sync]
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Vyber, jakou akci chceš provést'
+        required: true
+        default: 'sync'
+        type: choice
+        options:
+          - sync
+          - clear
+          - dump
 
 jobs:
-sync:
-runs-on: ubuntu-latest
+  sync:
+    runs-on: ubuntu-latest
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: '3.11'
-      cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-  - name: Install dependencies
-    run: |
-      python -m pip install --upgrade pip
-      if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-  - name: Run selected action
-    env:
-      GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-      # 1. Uživatel
-      BAK_USER_1: ${{ secrets.BAK_USER_1 }}
-      BAK_PASS_1: ${{ secrets.BAK_PASS_1 }} CALENDAR_ID_1:${{ secrets.CALENDAR_ID_1 }}
-      # 2. Uživatel
-      BAK_USER_2: ${{ secrets.BAK_USER_2 }}
-      BAK_PASS_2: ${{ secrets.BAK_PASS_2 }} CALENDAR_ID_2:${{ secrets.CALENDAR_ID_2 }}
-      # Globální nastavení
-      BAK_URL: "https://gyarab.bakalari.cz"
-      RESPECT_20MIN_RULE: "false"
-    run: |
-      # Získáme volbu z GitHub rozhraní. Pokud se to spustilo samo (repository_dispatch), bude to prázdné -> použijeme sync
-      ACTION="${{ github.event.inputs.action_type }}"
-      
-      if [[ "$ACTION" == clear* ]]; then
-        echo "Spouštím čistění kalendáře..."
-        python clear_calendar.py
-      elif [[ "$ACTION" == dump* ]]; then
-        echo "Stahuji surová data z API (Dump)..."
-        python dump_api.py
-      else
-        echo "Spouštím běžnou synchronizaci..."
-        python sync.py
-      fi
+      - name: Run selected action
+        env:
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          BAK_USER_1: ${{ secrets.BAK_USER_1 }}
+          BAK_PASS_1: ${{ secrets.BAK_PASS_1 }}
+          CALENDAR_ID_1: ${{ secrets.CALENDAR_ID_1 }}
+          BAK_USER_2: ${{ secrets.BAK_USER_2 }}
+          BAK_PASS_2: ${{ secrets.BAK_PASS_2 }}
+          CALENDAR_ID_2: ${{ secrets.CALENDAR_ID_2 }}
+          BAK_URL: "https://gyarab.bakalari.cz"
+          RESPECT_20MIN_RULE: "false"
+        run: |
+          ACTION="${{ github.event.inputs.action_type || github.event.client_payload.action_type || 'sync' }}"
+          echo "Selected action: ${ACTION}"
 
-  - name: Upload Bakalari Dump Artifact
-    # Tento krok proběhne JEN TEHDY, pokud jsi vybral akci "dump"
-    if: startsWith(github.event.inputs.action_type, 'dump')
-    uses: actions/upload-artifact@v4
-    with:
-      name: bakalari-dump-json
-      path: bakalari_dump.json
-      retention-days: 5
+          case "${ACTION}" in
+            clear*)
+              echo "Spouštím čistění kalendáře..."
+              python clear_calendar.py
+              ;;
+            dump*)
+              echo "Stahuji surová data z API (Dump)..."
+              python dump_api.py
+              ;;
+            *)
+              echo "Spouštím běžnou synchronizaci..."
+              python sync.py
+              ;;
+          esac
+
+      - name: Upload Bakalari Dump Artifact
+        if: >
+          startsWith(github.event.inputs.action_type || github.event.client_payload.action_type || '', 'dump')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakalari-dump-json
+          path: bakalari_dump.json
+          retention-days: 5
