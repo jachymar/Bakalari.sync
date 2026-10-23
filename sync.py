@@ -195,6 +195,46 @@ def extract_absences(data):
     return result
 
 
+def fetch_daily_absences_by_subject(user_base_url, headers, date_str):
+    """Dotaz na absenci v konkrétní den pro získání detailu zameškaných předmětů (pro čerstvé absence)."""
+    try:
+        resp = requests.get(
+            f"{user_base_url}/absence/student?from={date_str}&to={date_str}",
+            headers=headers,
+            timeout=30,
+            verify=False
+        )
+        if not resp.ok:
+            return {}
+        data = resp.json()
+        
+        day_agg = data.get("Absences", [{}])
+        day_agg = day_agg[0] if day_agg else {}
+        
+        unsolved = day_agg.get("Unsolved", 0)
+        school = day_agg.get("School", 0)
+        
+        default_status = "omluveno"
+        if unsolved > 0:
+            default_status = "neomluveno"
+        elif school > 0:
+            default_status = "skolni"
+            
+        abs_map = {}
+        for subj in data.get("AbsencesPerSubject", []):
+            name = subj.get("SubjectName")
+            if not name:
+                continue
+            if subj.get("Base", 0) > 0 or subj.get("Late", 0) > 0:
+                abs_map[name] = default_status
+            elif subj.get("School", 0) > 0:
+                abs_map[name] = "skolni"
+        return abs_map
+    except Exception as e:
+        print(f"Chyba při stahování detailu absence pro {date_str}: {e}")
+        return {}
+
+
 def _atom_text(atom, subject):
     change = atom.get("Change")
     values = [subject]
@@ -549,7 +589,7 @@ def event_color_for(change_info, title, absence_status=None):
     if title:
         return "2"   # Sage (Zelená pro události z Bakalářů jako exkurze celotřídní)
         
-    return "8"       # Graphite (Natvrdo šedá barva pro všechny běžné/suplované hodiny)
+    return "8"       # Graphite (Natvrdo šedá barva #6C6C6C pro všechny běžné/suplované hodiny)
 
 
 def _delete_event(service, calendar_id, event_id):
@@ -1046,10 +1086,35 @@ def sync_single_user(
         verify=False,
     )
     absence_response.raise_for_status()
-    absences = extract_absences(absence_response.json())
+    abs_data = absence_response.json()
+    absences = extract_absences(abs_data)
+
+    absences_by_subject = {}
+    for day_abs in abs_data.get("Absences", []):
+        if not isinstance(day_abs, dict):
+            continue
+        date_str = str(day_abs.get("Date") or "")[:10]
+        if not (monday.isoformat() <= date_str < window_end.isoformat()):
+            continue
+        
+        total_missed = (
+            day_abs.get("Unsolved", 0) + 
+            day_abs.get("Ok", 0) + 
+            day_abs.get("Missed", 0) + 
+            day_abs.get("School", 0)
+        )
+        if total_missed > 0:
+            daily_map = fetch_daily_absences_by_subject(user_base_url, headers, date_str)
+            for subj_name, status in daily_map.items():
+                absences_by_subject[(date_str, subj_name)] = status
 
     subjects = {
         item["Id"]: item.get("Abbrev", item.get("Name", "Hodina"))
+        for item in data.get("Subjects", [])
+        if item.get("Id") is not None
+    }
+    subject_names = {
+        item["Id"]: item.get("Name", "")
         for item in data.get("Subjects", [])
         if item.get("Id") is not None
     }
@@ -1150,7 +1215,13 @@ def sync_single_user(
             room_name = room_names.get(first_atom.get("RoomId"), room)
             class_name = extract_class_name(first_atom, classes)
             change_info = _change_description(first_atom)
+            
             absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
+            if not absence_status:
+                subj_full_name = subject_names.get(first_atom.get("SubjectId"), "")
+                if subj_full_name:
+                    absence_status = absences_by_subject.get((date_str, subj_full_name))
+
             teacher_name = extract_teacher_name(first_atom, teachers)
 
             summary = build_event_summary(subject, room, title)
