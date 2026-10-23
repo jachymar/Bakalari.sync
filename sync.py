@@ -583,9 +583,9 @@ def is_day_cancelled(day):
 def event_color_for(change_info, title, absence_status=None):
     """Vrátí barvu Google kalendáře pro typ události."""
     if absence_status in ("omluveno", "neomluveno"):
-        return "11"  # Tomato (Sytě červená pro osobní absenci)
+        return "4"  # Flamingo
     if absence_status == "skolni":
-        return "9"   # Blueberry (Modrá pro absenci z důvodu školní akce)
+        return "7"   # Peacock
     if title:
         return "2"   # Sage (Zelená pro události z Bakalářů jako exkurze celotřídní)
         
