@@ -155,14 +155,21 @@ def make_rfc3339(date_str, time_str):
 
 def _absence_status(item):
     """Vrátí text stavu absence z různých verzí API Bakalářů."""
-    for key in ("IsExcused", "Excused", "Omluveno"):
-        value = item.get(key)
-        if isinstance(value, bool):
-            return "omluveno" if value else "neomluveno"
     value = item.get("Type") or item.get("TypeName") or item.get("Status")
     if isinstance(value, dict):
         value = value.get("Name") or value.get("Description") or value.get("Id")
     text = str(value or "").strip().lower()
+    
+    # Detekce školní akce (exkurze, reprezentace, soutěž...)
+    if any(word in text for word in ("škol", "skol", "repre", "soutěž", "soutez", "akce", "exkurz", "kurz")):
+        return "skolni"
+
+    # Detekce běžné omluvené/neomluvené absence
+    for key in ("IsExcused", "Excused", "Omluveno"):
+        is_excused = item.get(key)
+        if isinstance(is_excused, bool):
+            return "omluveno" if is_excused else "neomluveno"
+
     if any(word in text for word in ("omluv", "excused", "justif")):
         return "omluveno"
     return "neomluveno"
@@ -535,15 +542,14 @@ def is_day_cancelled(day):
 
 def event_color_for(change_info, title, absence_status=None):
     """Vrátí barvu Google kalendáře pro typ události."""
-    # Nastavení barvy pro absenci (pouze Google event ID barvy 1-11)
-    if absence_status:
-        # '4' je Flamingo (světle červená/lososová) s nádechem červené, 
-        # která není tak silně agresivní. Pro sytě červenou lze použít '11' (Tomato).
-        return "4"
-        
+    if absence_status in ("omluveno", "neomluveno"):
+        return "11"  # Tomato (Sytě červená pro osobní absenci)
+    if absence_status == "skolni":
+        return "9"   # Blueberry (Modrá pro absenci z důvodu školní akce)
     if title:
-        return "2"
-    return None
+        return "2"   # Sage (Zelená pro události z Bakalářů jako exkurze celotřídní)
+        
+    return "8"       # Graphite (Natvrdo šedá barva pro všechny běžné/suplované hodiny)
 
 
 def _delete_event(service, calendar_id, event_id):
