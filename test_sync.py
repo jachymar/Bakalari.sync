@@ -18,11 +18,67 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(len(group), 3)
         self.assertEqual(group[-1][2][1], "10:25")
 
+    def test_group_special_event_bridges_cancelled_lesson_in_the_middle(self):
+        """
+        Ověří, že pokud je uprostřed celodenní exkurze zrušená hodina (např. 6. hodina CH - Absence of class),
+        group_special_event_atoms nezastaví na 5. hodině, ale spojí celou exkurzi 07:45 - 15:45 bez díry.
+        """
+        atoms = [
+            ({"HourId": 5, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("11:30", "12:15")),
+            (
+                {
+                    "HourId": 6,
+                    "SubjectId": 10,
+                    "Change": {"ChangeType": "Canceled", "Description": "Absence of class"},
+                },
+                "CH",
+                ("12:25", "13:10"),
+            ),
+            ({"HourId": 7, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("13:15", "14:00")),
+            ({"HourId": 8, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("14:05", "15:45")),
+        ]
+
+        group, next_index = sync.group_special_event_atoms(atoms, 0)
+
+        self.assertEqual(next_index, 4)
+        self.assertEqual(len(group), 3)
+        self.assertEqual(group[0][2][0], "11:30")
+        self.assertEqual(max(h[1] for _, _, h in group), "15:45")
+
+    def test_filter_and_sort_day_atoms_drops_cancelled_atom_when_excursion_is_in_same_hour(self):
+        """
+        Ověří, že když Bakaláři vrátí v 6. hodině zároveň zrušenou Chemii (CH) i aktivní Exkurzi (Exk),
+        zrušený atom v 6. hodině se zahodí a exkurze zůstane souvislá.
+        """
+        raw_atoms = [
+            {"HourId": 5, "SubjectId": 99, "Name": "Exkurze"},
+            {
+                "HourId": 6,
+                "SubjectId": 10,
+                "Change": {"ChangeType": "Canceled", "Description": "Absence of class"},
+            },
+            {"HourId": 6, "SubjectId": 99, "Name": "Exkurze"},
+            {"HourId": 7, "SubjectId": 99, "Name": "Exkurze"},
+        ]
+        subjects = {10: "CH", 99: "Exk"}
+        hours = {
+            5: ("11:30", "12:15"),
+            6: ("12:25", "13:10"),
+            7: ("13:15", "14:00"),
+        }
+
+        filtered = sync.filter_and_sort_day_atoms(raw_atoms, subjects, hours)
+        self.assertEqual(len(filtered), 3)
+
+        group, next_index = sync.group_special_event_atoms(filtered, 0)
+        self.assertEqual(next_index, 3)
+        self.assertEqual(max(h[1] for _, _, h in group), "14:00")
+
     def test_special_events_are_green_and_cancellations_skip_day(self):
         self.assertEqual(sync.event_color_for("", "Exkurze"), "2")
         self.assertEqual(sync.event_color_for("Suplování", ""), "8")
-        self.assertEqual(sync.event_color_for("", "", "omluveno"), "11")
-        self.assertEqual(sync.event_color_for("", "", "skolni"), "9")
+        self.assertEqual(sync.event_color_for("", "", "omluveno"), "4")
+        self.assertEqual(sync.event_color_for("", "", "skolni"), "7")
         self.assertTrue(sync.is_day_cancelled({"IsHoliday": True}))
         self.assertTrue(sync.is_day_cancelled({"Name": "Svátek"}))
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))
@@ -44,6 +100,13 @@ class SpecialEventGroupingTests(unittest.TestCase):
             sync._is_cancelled(
                 {"SubjectId": 5, "Change": {"ChangeType": "RoomChanged", "Description": "Přesun do učebny 102"}},
                 "Matematika",
+            )
+        )
+        # Pokud má atom v Change Canceled, ale zároveň jde o Exkurzi (TypeAbbrev="Exk"), nesmí být brán jako zrušený
+        self.assertFalse(
+            sync._is_cancelled(
+                {"SubjectId": None, "Change": {"ChangeType": "Canceled", "TypeAbbrev": "Exk", "TypeName": "Exkurze"}},
+                "Hodina",
             )
         )
 
