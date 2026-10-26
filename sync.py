@@ -25,9 +25,13 @@ CANCELLED_WORDS = (
     "removed",
     "vyjmut",
     "volno",
+    "absence of class",
+    "nepřítomnost",
+    "nepritomnost",
 )
 SPECIAL_EVENT_WORDS = (
     "exkurz",
+    "exk",
     "výlet",
     "vylet",
     "projekt",
@@ -120,7 +124,8 @@ def normalize_time(value):
 
 def extract_hour_times(item):
     start = (
-        item.get("StartTime")
+        item.get("BeginTime")
+        or item.get("StartTime")
         or item.get("Start")
         or item.get("TimeFrom")
         or item.get("From")
@@ -273,25 +278,43 @@ def _special_title(atom, subject):
     change = atom.get("Change")
     candidates = []
     if isinstance(change, dict):
-        candidates.extend(change.get(key) for key in ("Description", "Name", "TypeAbbrev"))
-    candidates.extend(atom.get(key) for key in ("Description", "Name"))
+        candidates.extend(
+            change.get(key) for key in ("TypeName", "Description", "Name", "TypeAbbrev")
+        )
+    candidates.extend(atom.get(key) for key in ("Description", "Name", "TypeName", "TypeAbbrev"))
     candidates.append(subject)
     for candidate in candidates:
         value = str(candidate or "").strip()
-        if value and not any(word in value.casefold() for word in CANCELLED_WORDS):
+        if not value:
+            continue
+        val_folded = value.casefold()
+        if any(word in val_folded for word in CANCELLED_WORDS):
+            continue
+        if any(word in val_folded for word in SPECIAL_EVENT_WORDS):
+            if val_folded == "exk":
+                return "Exkurze"
             return value
-    return subject
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and not any(word in value.casefold() for word in CANCELLED_WORDS):
+            if value.casefold() == "exk":
+                return "Exkurze"
+            return value
+    return "Exkurze" if str(subject or "").strip().casefold() == "exk" else subject
 
 
 def _is_cancelled(atom, subject):
     if not isinstance(atom, dict):
+        return False
+    # Pokud atom samotný reprezentuje speciální akci (např. Exkurze), nepovažujeme ho za zrušený
+    if _special_title(atom, subject):
         return False
     change = atom.get("Change")
     if isinstance(change, dict):
         change_type = str(change.get("ChangeType") or "").strip().casefold()
         if change_type in ("canceled", "cancelled", "removed"):
             return True
-        if atom.get("SubjectId") is None and not _special_title(atom, subject):
+        if atom.get("SubjectId") is None:
             return True
     text = _atom_text(atom, subject).casefold()
     return any(word in text for word in CANCELLED_WORDS)
@@ -804,7 +827,8 @@ def should_sync_now(day_data, current_time=None):
             if atom.get("HourId") is None:
                 continue
             start = (
-                atom.get("StartTime")
+                atom.get("BeginTime")
+                or atom.get("StartTime")
                 or atom.get("Start")
                 or atom.get("TimeFrom")
                 or atom.get("From")
@@ -870,22 +894,80 @@ def merge_timetable_data(base_data, extra_data):
     return base_data
 
 
+def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
+    """
+    Zpracuje atomy jednoho dne. Pokud jsou v jedné vyučovací hodině (HourId)
+    zároveň zrušená hodina (např. CH - Absence of class) a aktivní akce (např. Exk),
+    odfiltruje zrušený atom v této hodině, aby nerozbil souvislou exkurzi.
+    """
+    valid_items = []
+    active_hours = set()
+
+    for atom in raw_atoms:
+        if not isinstance(atom, dict):
+            continue
+        hour_id = atom.get("HourId")
+        hour_info = hours.get(hour_id)
+        if not hour_info:
+            continue
+        subject = subjects.get(atom.get("SubjectId"), "Hodina")
+        is_canc = _is_cancelled(atom, subject)
+        if not is_canc:
+            active_hours.add(hour_id)
+        valid_items.append((atom, subject, hour_info, is_canc, hour_id))
+
+    # Pokud je v dané hodině (HourId) alespoň jeden aktivní atom (např. Exkurze),
+    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy (např. zrušená Chemie).
+    filtered = []
+    for atom, subject, hour_info, is_canc, hour_id in valid_items:
+        if is_canc and hour_id in active_hours:
+            continue
+        filtered.append((atom, subject, hour_info))
+
+    # Seřadíme podle času začátku hodiny (a případně necháme aktivní před zrušenými)
+    filtered.sort(key=lambda item: (item[2][0], _is_cancelled(item[0], item[1])))
+    return filtered
+
+
 def group_special_event_atoms(atoms, start_index):
-    """Spojí sousední části jedné vícedobové akce i přes přestávky."""
+    """
+    Spojí sousední části jedné vícedobové akce (např. Exkurze) i přes přestávky
+    a přes případné zrušené hodiny (Absence of class), které leží uprostřed akce.
+    """
     atom, subject, hour_info = atoms[start_index]
     title = _special_title(atom, subject)
     if not title:
         return [(atom, subject, hour_info)], start_index + 1
+
     group = [(atom, subject, hour_info)]
     next_index = start_index + 1
+
     while next_index < len(atoms):
         next_atom, next_subject, next_info = atoms[next_index]
+
         if _is_cancelled(next_atom, next_subject):
+            # Zkontrolujeme, zda za jednou či více zrušenými hodinami pokračuje STEJNÁ akce.
+            lookahead = next_index + 1
+            while lookahead < len(atoms) and _is_cancelled(
+                atoms[lookahead][0], atoms[lookahead][1]
+            ):
+                lookahead += 1
+
+            if (
+                lookahead < len(atoms)
+                and _special_title(atoms[lookahead][0], atoms[lookahead][1]) == title
+            ):
+                # Přemostíme zrušené hodiny a pokračujeme ve spojování exkurze!
+                next_index = lookahead
+                continue
             break
+
         if _special_title(next_atom, next_subject) != title:
             break
+
         group.append((next_atom, next_subject, next_info))
         next_index += 1
+
     return group, next_index
 
 
@@ -943,57 +1025,74 @@ def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
     }
 
 
-def load_users_config():
+def load_users_config(env=None):
     """Načte konfiguraci uživatelů z proměnných prostředí."""
-    users = []
+    if env is None:
+        env = os.environ
+    raw_users = []
 
     # 1. Způsob: USERS_JSON (pokud je použit)
-    users_json = os.environ.get("USERS_JSON")
+    users_json = env.get("USERS_JSON")
     if users_json:
         try:
-            users.extend(json.loads(users_json))
+            parsed = json.loads(users_json)
+            if isinstance(parsed, list):
+                raw_users.extend(parsed)
         except json.JSONDecodeError:
             print("Chyba: USERS_JSON nemá platný formát JSON.")
 
     # 2. Způsob: Číslované proměnné (BAK_USER_1, BAK_USER_2, atd.)
     numbered_indices = sorted(
-        int(k.split("_")[-1]) for k in os.environ.keys()
+        int(k.split("_")[-1])
+        for k in env.keys()
         if k.startswith("BAK_USER_") and k.split("_")[-1].isdigit()
     )
 
     for i in numbered_indices:
-        user = os.environ.get(f"BAK_USER_{i}")
-        password = os.environ.get(f"BAK_PASS_{i}")
+        user = env.get(f"BAK_USER_{i}")
+        password = env.get(f"BAK_PASS_{i}")
         if user and password:
-            users.append({
-                "user": user,
-                "password": password,
-                "current_calendar_id": os.environ.get(f"CALENDAR_ID_{i}") or os.environ.get(f"CURRENT_CALENDAR_ID_{i}"),
-                "permanent_calendar_id": os.environ.get(f"PERMANENT_CALENDAR_ID_{i}")
-            })
+            raw_users.append(
+                {
+                    "name": env.get(f"USER_NAME_{i}") or user,
+                    "user": user,
+                    "password": password,
+                    "current_calendar_id": env.get(f"CALENDAR_ID_{i}")
+                    or env.get(f"CURRENT_CALENDAR_ID_{i}"),
+                    "permanent_calendar_id": env.get(f"PERMANENT_CALENDAR_ID_{i}"),
+                    "bak_url": env.get(f"BAK_URL_{i}"),
+                }
+            )
 
     # 3. Způsob: Původní proměnné bez čísla (zpětná kompatibilita)
-    legacy_user = os.environ.get("BAK_USER")
-    legacy_pass = os.environ.get("BAK_PASS")
+    legacy_user = env.get("BAK_USER")
+    legacy_pass = env.get("BAK_PASS")
 
     if legacy_user and legacy_pass:
-        if not any(u.get("user") == legacy_user for u in users):
-            users.append({
-                "user": legacy_user,
-                "password": legacy_pass,
-                "current_calendar_id": os.environ.get("CALENDAR_ID") or os.environ.get("CURRENT_CALENDAR_ID"),
-                "permanent_calendar_id": os.environ.get("PERMANENT_CALENDAR_ID")
-            })
+        if not any(u.get("user") == legacy_user for u in raw_users):
+            raw_users.append(
+                {
+                    "name": env.get("USER_NAME") or legacy_user,
+                    "user": legacy_user,
+                    "password": legacy_pass,
+                    "current_calendar_id": env.get("CALENDAR_ID")
+                    or env.get("CURRENT_CALENDAR_ID"),
+                    "permanent_calendar_id": env.get("PERMANENT_CALENDAR_ID"),
+                    "bak_url": env.get("BAK_URL"),
+                }
+            )
 
-    if not users:
+    if not raw_users:
         raise KeyError(
             "Nebyl nalezen žádný uživatel k synchronizaci. "
             "Nastavte USERS_JSON, BAK_USER_1..N nebo BAK_USER a BAK_PASS."
         )
 
-    return users
-
-    
+    default_bak_url = env.get("BAK_URL", BAK_URL)
+    return [
+        _normalize_user_entry(u, idx + 1, default_bak_url=default_bak_url)
+        for idx, u in enumerate(raw_users)
+    ]
 
 
 def sync_single_user(
@@ -1173,14 +1272,11 @@ def sync_single_user(
             continue
         if is_day_cancelled(day):
             continue
-        atoms = []
-        for atom in day.get("Atoms", []):
-            subject = subjects.get(atom.get("SubjectId"), "Hodina")
-            hour_info = hours.get(atom.get("HourId"))
-            if hour_info:
-                atoms.append((atom, subject, hour_info))
+
+        atoms = filter_and_sort_day_atoms(day.get("Atoms", []), subjects, hours)
         if not atoms:
             continue
+
         index = 0
         while index < len(atoms):
             atom, subject, hour_info = atoms[index]
@@ -1206,6 +1302,27 @@ def sync_single_user(
                 continue
 
             group, next_index = group_special_event_atoms(atoms, index)
+
+            # Pokud byly uvnitř spojené exkurze přeskočeny zrušené hodiny, smažeme jejich případné staré eventy
+            if next_index - index > len(group):
+                grouped_starts = {h_data[0] for _, _, h_data in group}
+                for skipped_idx in range(index, next_index):
+                    _, skipped_subj, skipped_h_info = atoms[skipped_idx]
+                    skipped_start = skipped_h_info[0]
+                    if skipped_start not in grouped_starts:
+                        if _delete_event(
+                            service,
+                            target_calendar_id,
+                            _event_id(date_str, skipped_start, skipped_subj),
+                        ):
+                            deleted += 1
+                        if _delete_event(
+                            service,
+                            target_calendar_id,
+                            _legacy_event_id(date_str, skipped_start, skipped_subj),
+                        ):
+                            deleted += 1
+
             if title:
                 end_time = max(hour_data[1] for _, _, hour_data in group)
             else:
