@@ -332,53 +332,6 @@ def _change_description(atom):
     return ""
 
 
-def extract_cancelled_details(atom, subject, teachers=None):
-    """
-    Získá předmět a vyučujícího u zrušené hodiny.
-    Když Bakaláři hodinu zruší, často nastaví SubjectId=None a původní předmět s učitelem
-    vloží do textu změny, např. 'Canceled (CH, Loužecká Ivana)' nebo 'Zrušeno (M, Novák Jan)'.
-    """
-    subj_str = str(subject or "").strip()
-    teacher_name = extract_teacher_name(atom, teachers)
-
-    change = atom.get("Change")
-    texts_to_search = []
-    if isinstance(change, dict):
-        for key in ("Description", "TypeName", "Name", "TypeAbbrev"):
-            val = change.get(key)
-            if isinstance(val, str) and val.strip():
-                texts_to_search.append(val.strip())
-    for key in ("Description", "Name", "TypeName"):
-        val = atom.get(key)
-        if isinstance(val, str) and val.strip():
-            texts_to_search.append(val.strip())
-
-    for text in texts_to_search:
-        # Hledáme vzor "... (PŘEDMĚT, UČITEL)" např. "Canceled (CH, Loužecká Ivana)"
-        match = re.search(r"\(([^(),]+),\s*([^()]+)\)", text)
-        if match:
-            parsed_subj = match.group(1).strip()
-            parsed_teacher = match.group(2).strip()
-            if (not subj_str or subj_str == "Hodina") and parsed_subj:
-                subj_str = parsed_subj
-            if not teacher_name and parsed_teacher:
-                teacher_name = parsed_teacher
-            break
-
-    if not subj_str or subj_str == "Hodina":
-        for text in texts_to_search:
-            match_single = re.search(r"\(([^()]+)\)", text)
-            if match_single:
-                candidate = match_single.group(1).strip()
-                if candidate and not any(
-                    w in candidate.casefold() for w in CANCELLED_WORDS
-                ):
-                    subj_str = candidate
-                    break
-
-    return subj_str or "Hodina", teacher_name
-
-
 def extract_teacher_name(atom, teachers=None):
     """Vrátí jméno vyučujícího z dat hodiny, pokud je dostupné."""
     if not isinstance(atom, dict):
@@ -474,16 +427,6 @@ def build_event_summary(subject, room, title=None):
     return base_title
 
 
-def build_cancelled_event_summary(subject, room=""):
-    """Vytvoří název zrušené hodiny pro samostatný kalendář smazaných hodin."""
-    base = build_event_summary(subject, room)
-    if not base:
-        return "Zrušeno: Hodina"
-    if base.casefold().startswith(("zrušeno", "zruseno", "zruš.", "canceled", "cancelled")):
-        return base
-    return f"Zrušeno: {base}"
-
-
 def build_event_location(class_name, room, room_name=None):
     """Vytvoří lokaci akce: preferuje skutečný název učebny z Bakalářů, pak číslo učebny."""
     class_value = str(class_name or "").strip()
@@ -570,12 +513,15 @@ def week_window(reference_date=None):
 
 
 def cleanup_cutoff_date(reference_date=None):
-    """Vrátí datum, před kterým se mažou staré týdny (předchozí týden se maže v pátek)."""
+    """
+    Vrátí datum, před kterým se mažou staré týdny.
+    Minulý týden se z hlavního kalendáře maže vždy až v pondělí nového týdne.
+    """
     if reference_date is None:
         reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
     week_start = reference_date - timedelta(days=reference_date.weekday())
-    if reference_date.weekday() >= 4:
-        return week_start
+    
+    # Hranici mazání držíme vždy 7 dní před začátkem (pondělím) aktuálního týdne
     return week_start - timedelta(days=7)
 
 
@@ -993,20 +939,8 @@ def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
     zároveň zrušená hodina (např. CH - Absence of class) a aktivní akce (např. Exk),
     odfiltruje zrušený atom v této hodině, aby nerozbil souvislou exkurzi.
     """
-    filtered, _ = split_day_atoms(raw_atoms, subjects, hours)
-    return filtered
-
-
-def split_day_atoms(raw_atoms, subjects, hours):
-    """
-    Rozdělí atomy daného dne na:
-    1. `filtered` - atomy pro hlavní rozvrh (kde zrušená hodina ve stejném slotu jako aktivní akce
-       je odfiltrována, aby nerozbila spojení exkurze).
-    2. `cancelled_atoms` - všechny zrušené atomy v daném dni (pro zápis do kalendáře smazaných hodin).
-    """
     valid_items = []
     active_hours = set()
-    cancelled_atoms = []
 
     for atom in raw_atoms:
         if not isinstance(atom, dict):
@@ -1017,23 +951,21 @@ def split_day_atoms(raw_atoms, subjects, hours):
             continue
         subject = subjects.get(atom.get("SubjectId"), "Hodina")
         is_canc = _is_cancelled(atom, subject)
-        if is_canc:
-            cancelled_atoms.append((atom, subject, hour_info))
-        else:
+        if not is_canc:
             active_hours.add(hour_id)
         valid_items.append((atom, subject, hour_info, is_canc, hour_id))
 
     # Pokud je v dané hodině (HourId) alespoň jeden aktivní atom (např. Exkurze),
-    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy pro hlavní kalendář.
+    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy (např. zrušená Chemie).
     filtered = []
     for atom, subject, hour_info, is_canc, hour_id in valid_items:
         if is_canc and hour_id in active_hours:
             continue
         filtered.append((atom, subject, hour_info))
 
+    # Seřadíme podle času začátku hodiny (a případně necháme aktivní před zrušenými)
     filtered.sort(key=lambda item: (item[2][0], _is_cancelled(item[0], item[1])))
-    cancelled_atoms.sort(key=lambda item: item[2][0])
-    return filtered, cancelled_atoms
+    return filtered
 
 
 def group_special_event_atoms(atoms, start_index):
@@ -1262,7 +1194,7 @@ def sync_single_user(
     cleanup_before = cleanup_cutoff_date(today)
     arch_start, arch_end = archive_window(today)
 
-    # V hlavních kalendářích mažeme vše před cleanup_before (v pátek se maže minulý týden, od Po do Čt předminulý)
+    # V hlavních kalendářích mažeme vše před cleanup_before (minulý týden se maže až s úderem nového pondělí)
     expired_deleted = delete_expired_events(
         service,
         (current_calendar_id, permanent_calendar_id),
@@ -1419,14 +1351,8 @@ def sync_single_user(
         if is_day_cancelled(day):
             continue
 
-        # Pokud jsme v režimu bez archivu, zpracováváme jen dny od pondělí aktuálního týdne
-        if not archive_calendar_id and not (monday.isoformat() <= date_str < window_end.isoformat()):
-            continue
-
-        # Pokud daný den leží v hlavním kalendáři (před pondělím aktuálního týdne, tj. minulý týden Po-Čt),
-        # ale nemáme zapnutý archiv, v hlavním kalendáři ho necháme být a nepřepisujeme,
-        # pokud ovšem nechceme aktualizovat i minulý týden. Pomocí select_calendar_id určíme cílový kalendář:
-        if not archive_calendar_id and date_str < monday.isoformat():
+        # Pokud jsme v režimu bez archivu, zpracováváme jen dny od minulého pondělí (cleanup_before) do konce okna
+        if not archive_calendar_id and not (cleanup_before.isoformat() <= date_str < window_end.isoformat()):
             continue
 
         target_calendar_id = select_calendar_id(
@@ -1437,12 +1363,6 @@ def sync_single_user(
             archive_calendar_id=archive_calendar_id,
         )
         if not target_calendar_id:
-            continue
-
-        # Aby v hlavním kalendáři zůstal zachován dosavadní chování (synchronizace od monday do window_end),
-        # pokud den spadá do minulého týdne (cleanup_before <= date < monday) a target je hlavní kalendář,
-        # necháme aktivní události v hlavním kalendáři, ale do archivu je nezapisujeme!
-        if target_calendar_id in (current_calendar_id, permanent_calendar_id) and date_str < monday.isoformat():
             continue
 
         atoms = filter_and_sort_day_atoms(day.get("Atoms", []), subjects, hours)
@@ -1553,16 +1473,17 @@ def sync_single_user(
                 updated += 1
             index = next_index
 
+    # V hlavním kalendáři vyčistíme všechny neaktivní (smazané) události
     deleted += delete_stale_window_events(
         service,
         (current_calendar_id, permanent_calendar_id),
-        monday,
+        cleanup_before,  # Mažeme až od cleanup_before, tj. od pondělí minulého týdne
         window_end,
         active_events_by_calendar,
     )
 
-    # V archivním kalendáři vyčistíme všechny neaktivní události v celém okně (arch_start až arch_end),
-    # což zároveň automaticky smaže z archivu všechny hodiny, které teď leží v hlavním kalendáři!
+    # V archivním kalendáři vyčistíme všechny neaktivní události v celém jeho okně,
+    # což zároveň z archivu automaticky smaže všechny dny, které se přesunuly zpět do hlavního kalendáře!
     if archive_calendar_id and archive_calendar_id not in (
         current_calendar_id,
         permanent_calendar_id,
