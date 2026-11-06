@@ -503,6 +503,125 @@ def execute_with_backoff(request, attempts=6):
     raise RuntimeError("Google Calendar request failed without a result.")
 
 
+def execute_batch(service, request_dict, max_retries=5):
+    """Provede dávkové HTTP požadavky s podporou retry při rate limitu na jednotlivé requesty."""
+    if not request_dict:
+        return {}, {}
+        
+    responses = {}
+    exceptions = {}
+    
+    def callback(request_id, response, exception):
+        if exception:
+            exceptions[request_id] = exception
+        else:
+            responses[request_id] = response
+            
+    req_items = list(request_dict.items())
+    
+    for attempt in range(max_retries):
+        retry_items = []
+        
+        # Batch po maximeálně 50 prvcích (limit Googlu)
+        for i in range(0, len(req_items), 50):
+            chunk = req_items[i:i+50]
+            batch = service.new_batch_http_request(callback=callback)
+            for req_id, req in chunk:
+                batch.add(req, request_id=req_id)
+            
+            try:
+                execute_with_backoff(batch) # Zachytí výjimečně 429 na úrovni CELÉ dávky
+            except Exception:
+                raise
+                
+            time.sleep(0.1) # Krátká pauza mezi dávkami pro klid Google serverů
+            
+        # Zkontrolujeme callbacky, zda nebyla část dávky individuálně odříznuta
+        for req_id, exc in list(exceptions.items()):
+            if isinstance(exc, HttpError) and exc.resp.status in (429, 503):
+                del exceptions[req_id]
+                retry_items.append((req_id, request_dict[req_id]))
+                
+        if not retry_items:
+            break
+            
+        req_items = retry_items
+        delay = min(60, 2 ** attempt) + random.uniform(0, 1)
+        print(f"Část dávky limitována (Rate Limit), opakuji {len(req_items)} položek za {delay:.1f}s")
+        time.sleep(delay)
+        
+    return responses, exceptions
+
+
+def batch_delete_events(service, calendar_event_pairs):
+    """Smaže seznam událostí v dávkách po 50 kusech."""
+    if not calendar_event_pairs:
+        return 0
+    reqs = {
+        f"del_{i}": service.events().delete(calendarId=c, eventId=e) 
+        for i, (c, e) in enumerate(calendar_event_pairs)
+    }
+    resp, _ = execute_batch(service, reqs)
+    return len(resp)
+
+
+def batch_upsert_events(service, calendar_body_pairs):
+    """Vloží/Aktualizuje události chytře přes dávky včetně ošetření smazaných hodin (410/409)."""
+    if not calendar_body_pairs:
+        return 0, 0
+        
+    inserted = 0
+    updated = 0
+    
+    # 1. Krok: Zkusit vše jako nové Insert (často nejrychlejší cesta)
+    insert_reqs = {
+        f"ins_{i}": service.events().insert(calendarId=c, body={**b, "status": "confirmed"}) 
+        for i, (c, b) in enumerate(calendar_body_pairs)
+    }
+    ins_resp, ins_exc = execute_batch(service, insert_reqs)
+    inserted += len(ins_resp)
+    
+    # 2. Krok: Co selhalo na 409 (Conflict = už existuje), zkusíme plně updatovat
+    update_reqs = {}
+    for req_id, exc in ins_exc.items():
+        if exc.resp.status == 409:
+            idx = int(req_id.split("_")[1])
+            c, b = calendar_body_pairs[idx]
+            update_reqs[f"upd_{idx}"] = service.events().update(calendarId=c, eventId=b["id"], body={**b, "status": "confirmed"})
+            
+    if update_reqs:
+        upd_resp, upd_exc = execute_batch(service, update_reqs)
+        updated += len(upd_resp)
+        
+        # 3. Krok: Co selhalo na 404/410 při updatu, musíme založit znovu přes záchranné fallback ID
+        fallback_reqs = {}
+        for req_id, exc in upd_exc.items():
+            if exc.resp.status in (404, 410):
+                idx = int(req_id.split("_")[1])
+                c, b = calendar_body_pairs[idx]
+                fb_id = hashlib.md5(f"{b['id']}_restored".encode("utf-8")).hexdigest()
+                fallback_reqs[f"fbk_{idx}"] = service.events().insert(calendarId=c, body={**b, "id": fb_id, "status": "confirmed"})
+                
+        if fallback_reqs:
+            fbk_resp, fbk_exc = execute_batch(service, fallback_reqs)
+            inserted += len(fbk_resp)
+            
+            # 4. Krok: Kdyby se vzácně fallback ID dostalo do 409, updatujeme fallback
+            fbk_upd_reqs = {}
+            for req_id, exc in fbk_exc.items():
+                if exc.resp.status == 409:
+                    idx = int(req_id.split("_")[1])
+                    c, b = calendar_body_pairs[idx]
+                    fb_id = hashlib.md5(f"{b['id']}_restored".encode("utf-8")).hexdigest()
+                    fbk_upd_reqs[f"fbkupd_{idx}"] = service.events().update(calendarId=c, eventId=fb_id, body={**b, "id": fb_id, "status": "confirmed"})
+            
+            if fbk_upd_reqs:
+                fbk_upd_resp, _ = execute_batch(service, fbk_upd_reqs)
+                updated += len(fbk_upd_resp)
+                
+    return inserted, updated
+
+
 def week_window(reference_date=None):
     """Vrátí pondělí aktuálního týdne a konec synchronizovaného okna (od pátku 2 týdny dopředu)."""
     if reference_date is None:
@@ -654,74 +773,16 @@ def event_color_for(change_info, title, absence_status=None):
     return "8"       # Graphite (Natvrdo šedá barva #6C6C6C pro všechny běžné/suplované hodiny)
 
 
-def _delete_event(service, calendar_id, event_id):
-    try:
-        execute_with_backoff(
-            service.events().delete(calendarId=calendar_id, eventId=event_id)
-        )
-        return True
-    except HttpError as error:
-        if error.resp.status not in (404, 410):
-            raise
-        return False
-
-
-def upsert_event(service, calendar_id, event_body):
-    """Vloží nebo aktualizuje událost a ošetří případ, kdy byla dříve smazána (HTTP 409/410)."""
-    body_with_status = {**event_body, "status": "confirmed"}
-    event_id = body_with_status["id"]
-    try:
-        execute_with_backoff(
-            service.events().insert(calendarId=calendar_id, body=body_with_status)
-        )
-        return "inserted", event_id
-    except HttpError as error:
-        if error.resp.status != 409:
-            raise
-        try:
-            execute_with_backoff(
-                service.events().update(
-                    calendarId=calendar_id,
-                    eventId=event_id,
-                    body=body_with_status,
-                )
-            )
-            return "updated", event_id
-        except HttpError as update_error:
-            if update_error.resp.status not in (404, 410):
-                raise
-            fallback_id = hashlib.md5(
-                f"{event_id}_restored".encode("utf-8")
-            ).hexdigest()
-            fallback_body = {**body_with_status, "id": fallback_id}
-            try:
-                execute_with_backoff(
-                    service.events().insert(
-                        calendarId=calendar_id, body=fallback_body
-                    )
-                )
-                return "inserted", fallback_id
-            except HttpError as fallback_error:
-                if fallback_error.resp.status != 409:
-                    raise
-                execute_with_backoff(
-                    service.events().update(
-                        calendarId=calendar_id,
-                        eventId=fallback_id,
-                        body=fallback_body,
-                    )
-                )
-                return "updated", fallback_id
-
-
 def delete_expired_events(service, calendar_ids, week_start):
-    """Odstraní události tohoto synchronizátoru před začátkem aktuálního týdne."""
+    """Odstraní události z kalendářů dávkově."""
     time_max = datetime.combine(
         week_start,
         datetime.min.time(),
         tzinfo=ZoneInfo("Europe/Prague"),
     ).isoformat()
-    deleted = 0
+    
+    to_delete = []
+    
     for calendar_id in dict.fromkeys(
         calendar_id for calendar_id in calendar_ids if calendar_id
     ):
@@ -738,19 +799,19 @@ def delete_expired_events(service, calendar_ids, week_start):
             )
             for event in response.get("items", []):
                 event_id = event.get("id", "")
-                if re.fullmatch(r"[0-9a-f]{32}", event_id):
-                    if _delete_event(service, calendar_id, event_id):
-                        deleted += 1
+                if re.fullmatch(r"[0-9a-f]{32}(_restored)?", event_id):
+                    to_delete.append((calendar_id, event_id))
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-    return deleted
+                
+    return batch_delete_events(service, to_delete)
 
 
 def delete_stale_window_events(
     service, calendar_ids, week_start, window_end, active_events_by_calendar
 ):
-    """Odstraní z kalendářů v okně 14 dnů všechny události skriptu, které nejsou v rozvrhu."""
+    """Odstraní z kalendářů dávkově všechny události skriptu, které už nejsou aktivní."""
     time_min = datetime.combine(
         week_start,
         datetime.min.time(),
@@ -761,7 +822,9 @@ def delete_stale_window_events(
         datetime.min.time(),
         tzinfo=ZoneInfo("Europe/Prague"),
     ).isoformat()
-    deleted = 0
+    
+    to_delete = []
+    
     for calendar_id in dict.fromkeys(
         calendar_id for calendar_id in calendar_ids if calendar_id
     ):
@@ -780,13 +843,13 @@ def delete_stale_window_events(
             )
             for event in response.get("items", []):
                 event_id = event.get("id", "")
-                if re.fullmatch(r"[0-9a-f]{32}", event_id) and event_id not in keep_ids:
-                    if _delete_event(service, calendar_id, event_id):
-                        deleted += 1
+                if re.fullmatch(r"[0-9a-f]{32}(_restored)?", event_id) and event_id not in keep_ids:
+                    to_delete.append((calendar_id, event_id))
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-    return deleted
+                
+    return batch_delete_events(service, to_delete)
 
 
 def build_timetable_urls(date_str, base_url=None):
@@ -955,15 +1018,12 @@ def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
             active_hours.add(hour_id)
         valid_items.append((atom, subject, hour_info, is_canc, hour_id))
 
-    # Pokud je v dané hodině (HourId) alespoň jeden aktivní atom (např. Exkurze),
-    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy (např. zrušená Chemie).
     filtered = []
     for atom, subject, hour_info, is_canc, hour_id in valid_items:
         if is_canc and hour_id in active_hours:
             continue
         filtered.append((atom, subject, hour_info))
 
-    # Seřadíme podle času začátku hodiny (a případně necháme aktivní před zrušenými)
     filtered.sort(key=lambda item: (item[2][0], _is_cancelled(item[0], item[1])))
     return filtered
 
@@ -985,7 +1045,6 @@ def group_special_event_atoms(atoms, start_index):
         next_atom, next_subject, next_info = atoms[next_index]
 
         if _is_cancelled(next_atom, next_subject):
-            # Zkontrolujeme, zda za jednou či více zrušenými hodinami pokračuje STEJNÁ akce.
             lookahead = next_index + 1
             while lookahead < len(atoms) and _is_cancelled(
                 atoms[lookahead][0], atoms[lookahead][1]
@@ -996,7 +1055,6 @@ def group_special_event_atoms(atoms, start_index):
                 lookahead < len(atoms)
                 and _special_title(atoms[lookahead][0], atoms[lookahead][1]) == title
             ):
-                # Přemostíme zrušené hodiny a pokračujeme ve spojování exkurze!
                 next_index = lookahead
                 continue
             break
@@ -1161,7 +1219,7 @@ def sync_single_user(
     today=None,
     env=None,
 ):
-    """Synchronizuje rozvrh jednoho konkrétního uživatele do jeho Google Kalendáře."""
+    """Synchronizuje rozvrh jednoho konkrétního uživatele do jeho Google Kalendáře dávkově."""
     if env is None:
         env = os.environ
     if room_mapping is None:
@@ -1194,13 +1252,11 @@ def sync_single_user(
     cleanup_before = cleanup_cutoff_date(today)
     arch_start, arch_end = archive_window(today)
 
-    # V hlavních kalendářích mažeme vše před cleanup_before (minulý týden se maže až s úderem nového pondělí)
     expired_deleted = delete_expired_events(
         service,
         (current_calendar_id, permanent_calendar_id),
         cleanup_before,
     )
-    # V archivním kalendáři mažeme vše starší než ~2 měsíce (arch_start)
     if archive_calendar_id:
         expired_deleted += delete_expired_events(
             service,
@@ -1211,8 +1267,6 @@ def sync_single_user(
     token = get_bakalari_token(user, password, bak_url=user_bak_url)
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Pokud je aktivní archivní kalendář, stahujeme celé okno (2 měsíce zpět až 1 měsíc dopředu),
-    # jinak stahujeme jen aktivní okno hlavního kalendáře.
     fetch_start = arch_start if archive_calendar_id else monday
     fetch_end = arch_end if archive_calendar_id else window_end
 
@@ -1339,10 +1393,11 @@ def sync_single_user(
             f"Ukázka dat Hours: {sample}"
         )
 
-    inserted = 0
-    updated = 0
     deleted = 0
     active_events_by_calendar = {}
+    
+    events_to_delete = set()
+    events_to_upsert = []
 
     for day in data.get("Days", []):
         date_str = day.get("Date", "")[:10]
@@ -1351,7 +1406,6 @@ def sync_single_user(
         if is_day_cancelled(day):
             continue
 
-        # Pokud jsme v režimu bez archivu, zpracováváme jen dny od minulého pondělí (cleanup_before) do konce okna
         if not archive_calendar_id and not (cleanup_before.isoformat() <= date_str < window_end.isoformat()):
             continue
 
@@ -1376,42 +1430,21 @@ def sync_single_user(
             title = _special_title(atom, subject)
 
             if _is_cancelled(atom, subject):
-                if _delete_event(
-                    service,
-                    target_calendar_id,
-                    _event_id(date_str, start_time, subject),
-                ):
-                    deleted += 1
-                if _delete_event(
-                    service,
-                    target_calendar_id,
-                    _legacy_event_id(date_str, start_time, subject),
-                ):
-                    deleted += 1
+                events_to_delete.add((target_calendar_id, _event_id(date_str, start_time, subject)))
+                events_to_delete.add((target_calendar_id, _legacy_event_id(date_str, start_time, subject)))
                 index += 1
                 continue
 
             group, next_index = group_special_event_atoms(atoms, index)
 
-            # Pokud byly uvnitř spojené exkurze přeskočeny zrušené hodiny, smažeme jejich případné staré eventy
             if next_index - index > len(group):
                 grouped_starts = {h_data[0] for _, _, h_data in group}
                 for skipped_idx in range(index, next_index):
                     _, skipped_subj, skipped_h_info = atoms[skipped_idx]
                     skipped_start = skipped_h_info[0]
                     if skipped_start not in grouped_starts:
-                        if _delete_event(
-                            service,
-                            target_calendar_id,
-                            _event_id(date_str, skipped_start, skipped_subj),
-                        ):
-                            deleted += 1
-                        if _delete_event(
-                            service,
-                            target_calendar_id,
-                            _legacy_event_id(date_str, skipped_start, skipped_subj),
-                        ):
-                            deleted += 1
+                        events_to_delete.add((target_calendar_id, _event_id(date_str, skipped_start, skipped_subj)))
+                        events_to_delete.add((target_calendar_id, _legacy_event_id(date_str, skipped_start, skipped_subj)))
 
             if title:
                 end_time = max(hour_data[1] for _, _, hour_data in group)
@@ -1461,29 +1494,31 @@ def sync_single_user(
             if color_id is not None:
                 event_body["colorId"] = color_id
 
-            action, final_event_id = upsert_event(
-                service, target_calendar_id, event_body
-            )
-            active_events_by_calendar.setdefault(target_calendar_id, set()).add(
-                final_event_id
-            )
-            if action == "inserted":
-                inserted += 1
-            else:
-                updated += 1
+            events_to_upsert.append((target_calendar_id, event_body))
+            
+            active_events_by_calendar.setdefault(target_calendar_id, set()).update([
+                event_id,
+                hashlib.md5(f"{event_id}_restored".encode("utf-8")).hexdigest()
+            ])
+            
             index = next_index
 
-    # V hlavním kalendáři vyčistíme všechny neaktivní (smazané) události
+    # 1. Spustíme hromadné smazání zrušených událostí uvnitř aktivního okna
+    deleted += batch_delete_events(service, list(events_to_delete))
+    
+    # 2. Spustíme hromadný upsert (Insert / Update) aktivních událostí
+    inserted, updated = batch_upsert_events(service, events_to_upsert)
+
+    # 3. Vyčistíme staré události co v Bakalářích už nejsou pro celé hlavní okno
     deleted += delete_stale_window_events(
         service,
         (current_calendar_id, permanent_calendar_id),
-        cleanup_before,  # Mažeme až od cleanup_before, tj. od pondělí minulého týdne
+        cleanup_before,
         window_end,
         active_events_by_calendar,
     )
 
-    # V archivním kalendáři vyčistíme všechny neaktivní události v celém jeho okně,
-    # což zároveň z archivu automaticky smaže všechny dny, které se přesunuly zpět do hlavního kalendáře!
+    # 4. Vyčistíme archivní okno (čímž se archiv synchronizuje s přesuny dnů)
     if archive_calendar_id and archive_calendar_id not in (
         current_calendar_id,
         permanent_calendar_id,
