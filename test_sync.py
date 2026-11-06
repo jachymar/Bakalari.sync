@@ -4,6 +4,33 @@ from unittest import mock
 import sync
 
 
+def make_fake_service(events_mock):
+    class FakeBatch:
+        def __init__(self, callback):
+            self.callback = callback
+            self.reqs = []
+
+        def add(self, req, request_id):
+            self.reqs.append((request_id, req))
+
+        def execute(self):
+            for req_id, req in self.reqs:
+                try:
+                    res = req.execute()
+                    self.callback(req_id, res, None)
+                except sync.HttpError as e:
+                    self.callback(req_id, None, e)
+
+    class FakeService:
+        def events(self):
+            return events_mock
+
+        def new_batch_http_request(self, callback):
+            return FakeBatch(callback)
+
+    return FakeService()
+
+
 class SpecialEventGroupingTests(unittest.TestCase):
     def test_group_special_event_ignores_school_breaks(self):
         atoms = [
@@ -19,10 +46,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(group[-1][2][1], "10:25")
 
     def test_group_special_event_bridges_cancelled_lesson_in_the_middle(self):
-        """
-        Ověří, že pokud je uprostřed celodenní exkurze zrušená hodina (např. 6. hodina CH - Absence of class),
-        group_special_event_atoms nezastaví na 5. hodině, ale spojí celou exkurzi 07:45 - 15:45 bez díry.
-        """
         atoms = [
             ({"HourId": 5, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("11:30", "12:15")),
             (
@@ -46,10 +69,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(max(h[1] for _, _, h in group), "15:45")
 
     def test_filter_and_sort_day_atoms_drops_cancelled_atom_when_excursion_is_in_same_hour(self):
-        """
-        Ověří, že když Bakaláři vrátí v 6. hodině zároveň zrušenou Chemii (CH) i aktivní Exkurzi (Exk),
-        zrušený atom v 6. hodině se zahodí a exkurze zůstane souvislá.
-        """
         raw_atoms = [
             {"HourId": 5, "SubjectId": 99, "Name": "Exkurze"},
             {
@@ -102,7 +121,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 "Matematika",
             )
         )
-        # Pokud má atom v Change Canceled, ale zároveň jde o Exkurzi (TypeAbbrev="Exk"), nesmí být brán jako zrušený
         self.assertFalse(
             sync._is_cancelled(
                 {"SubjectId": None, "Change": {"ChangeType": "Canceled", "TypeAbbrev": "Exk", "TypeName": "Exkurze"}},
@@ -123,13 +141,8 @@ class SpecialEventGroupingTests(unittest.TestCase):
         )
 
     def test_archive_calendar_excludes_main_calendar_days_and_covers_2_months_back_1_month_ahead(self):
-        """
-        Ověří, že archivní kalendář pokrývá historii a vzdálenou budoucnost,
-        ale nikdy nedostane hodiny, které jsou v hlavním kalendáři (žádné duplicity).
-        """
         wednesday = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
 
-        # Minulý týden (ve středu ještě nesmazaný z hlavního kalendáře) -> patří do hlavního kalendáře
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-09-22", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
@@ -137,7 +150,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "main-cal",
         )
 
-        # Předminulý týden / měsíc zpátky -> vždy v archive-cal (minulý týden by se smazal až v pondělí)
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-08-25", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
@@ -145,7 +157,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "archive-cal",
         )
 
-        # Týden za oknem hlavního kalendáře (cca 3-4 týdny dopředu) -> v archive-cal
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-10-26", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
@@ -153,7 +164,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "archive-cal",
         )
 
-        # Aktuální a příští týden -> vždy v hlavním kalendáři, ne v archive-cal
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-09-30", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
@@ -166,9 +176,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
         sunday = sync.datetime.strptime("2026-10-04", "%Y-%m-%d").date()
         monday = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-        next_friday = sync.datetime.strptime("2026-10-09", "%Y-%m-%d").date()
 
-        # Pondělí až čtvrtek: generuje se aktuální + příští týden (14 dní)
         self.assertEqual(
             sync.week_window(thursday),
             (
@@ -183,7 +191,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
             ),
         )
-        # Pátek až neděle: generuje se aktuální + 2 týdny dopředu (21 dní)
         self.assertEqual(
             sync.week_window(friday),
             (
@@ -192,18 +199,14 @@ class SpecialEventGroupingTests(unittest.TestCase):
             ),
         )
 
-        # Mazání předchozího týdne probíhá TEĎ vždy až v pondělí (a zůstává tam přes víkend)
-        # Čtvrtek 1.10. -> aktuální pondělí je 28.9., cutoff je 21.9.
         self.assertEqual(
             sync.cleanup_cutoff_date(thursday),
             sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
         )
-        # Pátek 2.10. -> aktuální pondělí je 28.9., cutoff je STÁLE 21.9.
         self.assertEqual(
             sync.cleanup_cutoff_date(friday),
             sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
         )
-        # Pondělí 5.10. -> aktuální pondělí je 5.10., cutoff se konečně posune na 28.9.
         self.assertEqual(
             sync.cleanup_cutoff_date(monday),
             sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
@@ -234,13 +237,10 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest({})
 
         events = FakeEvents()
-
-        class FakeService:
-            def events(self):
-                return events
+        service = make_fake_service(events)
 
         week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-        deleted = sync.delete_expired_events(FakeService(), ["calendar"], week_start)
+        deleted = sync.delete_expired_events(service, ["calendar"], week_start)
 
         self.assertEqual(deleted, 1)
         self.assertEqual(events.deleted, [{"calendarId": "calendar", "eventId": "0123456789abcdef0123456789abcdef"}])
@@ -271,17 +271,14 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest({})
 
         events = FakeEvents()
-
-        class FakeService:
-            def events(self):
-                return events
+        service = make_fake_service(events)
 
         week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
         window_end = sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()
         active_by_cal = {"calendar": {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 
         deleted = sync.delete_stale_window_events(
-            FakeService(), ["calendar"], week_start, window_end, active_by_cal
+            service, ["calendar"], week_start, window_end, active_by_cal
         )
 
         self.assertEqual(deleted, 1)
@@ -377,7 +374,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(sleep_mock.call_count, 2)
 
-    def test_delete_event_ignores_410_already_deleted(self):
+    def test_batch_delete_events_ignores_410_already_deleted(self):
         class FakeRequest:
             def execute(self):
                 raise sync.HttpError(
@@ -389,13 +386,13 @@ class SpecialEventGroupingTests(unittest.TestCase):
             def delete(self, **kwargs):
                 return FakeRequest()
 
-        class FakeService:
-            def events(self):
-                return FakeEvents()
+        service = make_fake_service(FakeEvents())
+        
+        # Batch by měl ignorovat 410 z exceptions a prostě vrátit nulu úspěšných
+        deleted = sync.batch_delete_events(service, [("calendar", "0123456789abcdef0123456789abcdef")])
+        self.assertEqual(deleted, 0)
 
-        self.assertFalse(sync._delete_event(FakeService(), "calendar", "0123456789abcdef0123456789abcdef"))
-
-    def test_upsert_event_handles_409_and_410_deleted_resource(self):
+    def test_batch_upsert_handles_409_and_410_deleted_resource(self):
         class FakeRequest:
             def __init__(self, fn):
                 self.fn = fn
@@ -427,21 +424,18 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest(_run)
 
         events = FakeEvents()
+        service = make_fake_service(events)
 
-        class FakeService:
-            def events(self):
-                return events
-
-        action, final_id = sync.upsert_event(
-            FakeService(),
-            "calendar",
-            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"},
+        ins, upd = sync.batch_upsert_events(
+            service,
+            [("calendar", {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"})]
         )
 
-        self.assertEqual(action, "inserted")
-        self.assertNotEqual(final_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        self.assertEqual(len(final_id), 32)
-        self.assertEqual(events.inserted_bodies[0]["status"], "confirmed")
+        self.assertEqual(ins, 1)
+        self.assertEqual(upd, 0)
+        self.assertNotEqual(events.inserted_bodies[-1]["id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(len(events.inserted_bodies[-1]["id"]), 32)
+        self.assertEqual(events.inserted_bodies[-1]["status"], "confirmed")
 
     def test_load_users_config_supports_users_json_and_numbered_envs(self):
         json_env = {
