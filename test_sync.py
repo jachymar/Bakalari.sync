@@ -4,33 +4,6 @@ from unittest import mock
 import sync
 
 
-def make_fake_service(events_mock):
-    class FakeBatch:
-        def __init__(self, callback):
-            self.callback = callback
-            self.reqs = []
-
-        def add(self, req, request_id):
-            self.reqs.append((request_id, req))
-
-        def execute(self):
-            for req_id, req in self.reqs:
-                try:
-                    res = req.execute()
-                    self.callback(req_id, res, None)
-                except sync.HttpError as e:
-                    self.callback(req_id, None, e)
-
-    class FakeService:
-        def events(self):
-            return events_mock
-
-        def new_batch_http_request(self, callback):
-            return FakeBatch(callback)
-
-    return FakeService()
-
-
 class SpecialEventGroupingTests(unittest.TestCase):
     def test_group_special_event_ignores_school_breaks(self):
         atoms = [
@@ -237,10 +210,13 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest({})
 
         events = FakeEvents()
-        service = make_fake_service(events)
+
+        class FakeService:
+            def events(self):
+                return events
 
         week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-        deleted = sync.delete_expired_events(service, ["calendar"], week_start)
+        deleted = sync.delete_expired_events(FakeService(), ["calendar"], week_start)
 
         self.assertEqual(deleted, 1)
         self.assertEqual(events.deleted, [{"calendarId": "calendar", "eventId": "0123456789abcdef0123456789abcdef"}])
@@ -271,14 +247,17 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest({})
 
         events = FakeEvents()
-        service = make_fake_service(events)
+
+        class FakeService:
+            def events(self):
+                return events
 
         week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
         window_end = sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()
         active_by_cal = {"calendar": {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 
         deleted = sync.delete_stale_window_events(
-            service, ["calendar"], week_start, window_end, active_by_cal
+            FakeService(), ["calendar"], week_start, window_end, active_by_cal
         )
 
         self.assertEqual(deleted, 1)
@@ -374,7 +353,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(sleep_mock.call_count, 2)
 
-    def test_batch_delete_events_ignores_410_already_deleted(self):
+    def test_delete_event_ignores_410_already_deleted(self):
         class FakeRequest:
             def execute(self):
                 raise sync.HttpError(
@@ -386,13 +365,13 @@ class SpecialEventGroupingTests(unittest.TestCase):
             def delete(self, **kwargs):
                 return FakeRequest()
 
-        service = make_fake_service(FakeEvents())
-        
-        # Batch by měl ignorovat 410 z exceptions a prostě vrátit nulu úspěšných
-        deleted = sync.batch_delete_events(service, [("calendar", "0123456789abcdef0123456789abcdef")])
-        self.assertEqual(deleted, 0)
+        class FakeService:
+            def events(self):
+                return FakeEvents()
 
-    def test_batch_upsert_handles_409_and_410_deleted_resource(self):
+        self.assertFalse(sync._delete_event(FakeService(), "calendar", "0123456789abcdef0123456789abcdef"))
+
+    def test_upsert_event_handles_409_and_410_deleted_resource(self):
         class FakeRequest:
             def __init__(self, fn):
                 self.fn = fn
@@ -424,18 +403,21 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 return FakeRequest(_run)
 
         events = FakeEvents()
-        service = make_fake_service(events)
 
-        ins, upd = sync.batch_upsert_events(
-            service,
-            [("calendar", {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"})]
+        class FakeService:
+            def events(self):
+                return events
+
+        action, final_id = sync.upsert_event(
+            FakeService(),
+            "calendar",
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"},
         )
 
-        self.assertEqual(ins, 1)
-        self.assertEqual(upd, 0)
-        self.assertNotEqual(events.inserted_bodies[-1]["id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        self.assertEqual(len(events.inserted_bodies[-1]["id"]), 32)
-        self.assertEqual(events.inserted_bodies[-1]["status"], "confirmed")
+        self.assertEqual(action, "inserted")
+        self.assertNotEqual(final_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(len(final_id), 32)
+        self.assertEqual(events.inserted_bodies[0]["status"], "confirmed")
 
     def test_load_users_config_supports_users_json_and_numbered_envs(self):
         json_env = {
