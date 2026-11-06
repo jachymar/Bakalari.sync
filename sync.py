@@ -435,6 +435,7 @@ def select_calendar_id(date_str, current_calendar_id, permanent_calendar_id, ref
 
 
 def determine_target_calendar(date_str, current_cal, perm_cal, archive_cal, today, main_start, main_end):
+    """Určí kalendář: Pokud je v aktivním okně (minulý týden až +2 týdny), jde do hlavního. Jinak do archivu."""
     try:
         event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
@@ -492,6 +493,7 @@ def _delete_event(service, calendar_id, event_id):
 
 
 def smart_upsert_event(service, calendar_id, event_body, is_existing):
+    """Nahraje event jen tehdy, když dojde k jeho reálné změně (dle kontroly paměti)."""
     body_with_status = {**event_body, "status": "confirmed"}
     event_id = body_with_status["id"]
     try:
@@ -521,7 +523,7 @@ def smart_upsert_event(service, calendar_id, event_body, is_existing):
 
 
 def fetch_existing_events(service, calendar_ids, time_min, time_max):
-    """Stáhne do paměti všechny události z Googlu ve zvoleném okně."""
+    """Stáhne do paměti všechny události z Googlu ve zvoleném okně (Read-then-Write optimalizace)."""
     existing = {}
     t_min = datetime.combine(time_min, datetime.min.time(), tzinfo=ZoneInfo("Europe/Prague")).isoformat()
     t_max = datetime.combine(time_max, datetime.min.time(), tzinfo=ZoneInfo("Europe/Prague")).isoformat()
@@ -569,7 +571,7 @@ def is_event_unchanged(existing_ev, event_body):
 
 
 def delete_expired_events(service, calendar_ids, cutoff_date):
-    """Odstraní staré události v hluboké historii."""
+    """Odstraní staré události mimo synchronizační okno."""
     time_max = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=ZoneInfo("Europe/Prague")).isoformat()
     deleted = 0
     for calendar_id in set(c for c in calendar_ids if c):
@@ -715,6 +717,7 @@ def merge_timetable_data(base_data, extra_data):
 
 
 def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
+    """Zpracuje atomy a vyřadí duplicitní zrušené hodiny, které sdílí čas s exkurzí."""
     valid_items = []
     active_hours = set()
     for atom in raw_atoms:
@@ -740,6 +743,7 @@ def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
 
 
 def group_special_event_atoms(atoms, start_index):
+    """Spojí exkurze a přemostí případné díry ve zrušených hodinách."""
     atom, subject, hour_info = atoms[start_index]
     title = _special_title(atom, subject)
     if not title:
@@ -893,7 +897,7 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
     if archive_calendar_id:
         expired_deleted += delete_expired_events(service, [archive_calendar_id], archive_cleanup_start)
 
-    # 2. Stažení aktuálního stavu z Googlu do paměti
+    # 2. Stažení aktuálního stavu z Googlu do paměti (Optimalizace: Read-then-Write)
     existing_events = fetch_existing_events(
         service, 
         [current_calendar_id, permanent_calendar_id, archive_calendar_id], 
@@ -1031,6 +1035,7 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
             cal_existing = existing_events.get(target_calendar_id, {})
             existing_ev = cal_existing.get(event_id)
             
+            # Pokud se událost vůbec nezměnila, přeskočíme zbytečný zápis a API call
             if is_event_unchanged(existing_ev, event_body):
                 unchanged += 1
                 active_events_by_calendar.setdefault(target_calendar_id, set()).add(event_id)
@@ -1045,7 +1050,7 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
             index = next_index
 
     # 4. Zero API Read Cleanup - Hromadné smazání zrušených/přesunutých hodin
-    # Vše, co si skript v bodě 2 stáhl do paměti a nebylo přidáno do `active_events` v bodě 3, se nyní smaže.
+    # Vše, co si skript v bodě 2 stáhl do paměti a nebylo to nyní potvrzeno v `active_events`, smažeme.
     for cal_id, ex_events in existing_events.items():
         active_ids = active_events_by_calendar.get(cal_id, set())
         for eid in ex_events:
