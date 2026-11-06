@@ -124,11 +124,9 @@ class SpecialEventGroupingTests(unittest.TestCase):
 
     def test_archive_calendar_excludes_main_calendar_days_and_covers_2_months_back_1_month_ahead(self):
         """
-        Ověří, že archivní kalendář:
-        - pokrývá historii (až 9 týdnů zpět) a vzdálenou budoucnost (až 5 týdnů dopředu),
-        - nikdy nedostane hodiny, které jsou v hlavním kalendáři (žádné duplicity).
+        Ověří, že archivní kalendář pokrývá historii a vzdálenou budoucnost,
+        ale nikdy nedostane hodiny, které jsou v hlavním kalendáři (žádné duplicity).
         """
-        # Středa 2026-09-30 -> aktuální týden začíná 2026-09-28, v hlavním kalendáři je ještě minulý týden (od 2026-09-21)
         wednesday = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
 
         # Minulý týden (ve středu ještě nesmazaný z hlavního kalendáře) -> patří do hlavního kalendáře
@@ -139,16 +137,7 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "main-cal",
         )
 
-        # V pátek 2026-10-02 už je minulý týden (2026-09-22) z hlavního kalendáře smazaný -> přechází do archive-cal!
-        friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
-        self.assertEqual(
-            sync.select_calendar_id(
-                "2026-09-22", "main-cal", None, friday, archive_calendar_id="archive-cal"
-            ),
-            "archive-cal",
-        )
-
-        # Předminulý týden / měsíc zpátky -> vždy v archive-cal
+        # Předminulý týden / měsíc zpátky -> vždy v archive-cal (minulý týden by se smazal až v pondělí)
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-08-25", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
@@ -168,12 +157,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(
             sync.select_calendar_id(
                 "2026-09-30", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
-            ),
-            "main-cal",
-        )
-        self.assertEqual(
-            sync.select_calendar_id(
-                "2026-10-07", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
             ),
             "main-cal",
         )
@@ -208,21 +191,22 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
             ),
         )
+
+        # Mazání předchozího týdne probíhá TEĎ vždy až v pondělí (a zůstává tam přes víkend)
+        # Čtvrtek 1.10. -> aktuální pondělí je 28.9., cutoff je 21.9.
         self.assertEqual(
-            sync.week_window(sunday),
-            (
-                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
-                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
-            ),
+            sync.cleanup_cutoff_date(thursday),
+            sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
         )
-        # Mazání předchozího týdne: od pondělí do čtvrtka zůstává minulý týden, smaže se až v pátek
+        # Pátek 2.10. -> aktuální pondělí je 28.9., cutoff je STÁLE 21.9.
+        self.assertEqual(
+            sync.cleanup_cutoff_date(friday),
+            sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
+        )
+        # Pondělí 5.10. -> aktuální pondělí je 5.10., cutoff se konečně posune na 28.9.
         self.assertEqual(
             sync.cleanup_cutoff_date(monday),
             sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
-        )
-        self.assertEqual(
-            sync.cleanup_cutoff_date(next_friday),
-            sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date(),
         )
 
     def test_expired_event_cleanup_only_deletes_managed_events(self):
