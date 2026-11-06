@@ -332,6 +332,53 @@ def _change_description(atom):
     return ""
 
 
+def extract_cancelled_details(atom, subject, teachers=None):
+    """
+    Získá předmět a vyučujícího u zrušené hodiny.
+    Když Bakaláři hodinu zruší, často nastaví SubjectId=None a původní předmět s učitelem
+    vloží do textu změny, např. 'Canceled (CH, Loužecká Ivana)' nebo 'Zrušeno (M, Novák Jan)'.
+    """
+    subj_str = str(subject or "").strip()
+    teacher_name = extract_teacher_name(atom, teachers)
+
+    change = atom.get("Change")
+    texts_to_search = []
+    if isinstance(change, dict):
+        for key in ("Description", "TypeName", "Name", "TypeAbbrev"):
+            val = change.get(key)
+            if isinstance(val, str) and val.strip():
+                texts_to_search.append(val.strip())
+    for key in ("Description", "Name", "TypeName"):
+        val = atom.get(key)
+        if isinstance(val, str) and val.strip():
+            texts_to_search.append(val.strip())
+
+    for text in texts_to_search:
+        # Hledáme vzor "... (PŘEDMĚT, UČITEL)" např. "Canceled (CH, Loužecká Ivana)"
+        match = re.search(r"\(([^(),]+),\s*([^()]+)\)", text)
+        if match:
+            parsed_subj = match.group(1).strip()
+            parsed_teacher = match.group(2).strip()
+            if (not subj_str or subj_str == "Hodina") and parsed_subj:
+                subj_str = parsed_subj
+            if not teacher_name and parsed_teacher:
+                teacher_name = parsed_teacher
+            break
+
+    if not subj_str or subj_str == "Hodina":
+        for text in texts_to_search:
+            match_single = re.search(r"\(([^()]+)\)", text)
+            if match_single:
+                candidate = match_single.group(1).strip()
+                if candidate and not any(
+                    w in candidate.casefold() for w in CANCELLED_WORDS
+                ):
+                    subj_str = candidate
+                    break
+
+    return subj_str or "Hodina", teacher_name
+
+
 def extract_teacher_name(atom, teachers=None):
     """Vrátí jméno vyučujícího z dat hodiny, pokud je dostupné."""
     if not isinstance(atom, dict):
@@ -425,6 +472,16 @@ def build_event_summary(subject, room, title=None):
     if room_value and f"({room_value})" not in base_title:
         return f"{base_title} ({room_value})"
     return base_title
+
+
+def build_cancelled_event_summary(subject, room=""):
+    """Vytvoří název zrušené hodiny pro samostatný kalendář smazaných hodin."""
+    base = build_event_summary(subject, room)
+    if not base:
+        return "Zrušeno: Hodina"
+    if base.casefold().startswith(("zrušeno", "zruseno", "zruš.", "canceled", "cancelled")):
+        return base
+    return f"Zrušeno: {base}"
 
 
 def build_event_location(class_name, room, room_name=None):
@@ -522,22 +579,58 @@ def cleanup_cutoff_date(reference_date=None):
     return week_start - timedelta(days=7)
 
 
+def archive_window(reference_date=None):
+    """
+    Vrátí rozšířené okno pro archivní/historický kalendář:
+    9 týdnů (cca 2 měsíce) dozadu od pondělí aktuálního týdne
+    a 5 týdnů (cca 1 měsíc) dopředu.
+    """
+    if reference_date is None:
+        reference_date = datetime.now(ZoneInfo("Europe/Prague")).date()
+    week_start = reference_date - timedelta(days=reference_date.weekday())
+    archive_start = week_start - timedelta(weeks=9)
+    archive_end = week_start + timedelta(weeks=5)
+    return archive_start, archive_end
+
+
 def select_calendar_id(
-    date_str, current_calendar_id, permanent_calendar_id, reference_date=None
+    date_str,
+    current_calendar_id,
+    permanent_calendar_id,
+    reference_date=None,
+    archive_calendar_id=None,
 ):
-    """Vybere kalendář pro aktuální nebo následující kalendářní týden."""
-    if not current_calendar_id:
-        return permanent_calendar_id
-    if not permanent_calendar_id:
-        return current_calendar_id
+    """
+    Vybere cílový kalendář pro dané datum:
+    - Pokud datum spadá do aktivního okna hlavního kalendáře (od cleanup_cutoff_date do konce week_window),
+      vrátí current_calendar_id nebo permanent_calendar_id.
+    - Pokud datum leží mimo hlavní kalendář (stará historie nebo daleká budoucnost) a je nastaven
+      archive_calendar_id, vrátí archive_calendar_id.
+    - Jinak vrátí None (den se nesynchronizuje).
+    """
     try:
         event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
+        return current_calendar_id or permanent_calendar_id
+
+    week_start, main_end = week_window(reference_date)
+    main_start = cleanup_cutoff_date(reference_date)
+
+    if main_start <= event_date < main_end:
+        if not current_calendar_id:
+            return permanent_calendar_id
+        if not permanent_calendar_id:
+            return current_calendar_id
+        if event_date >= week_start + timedelta(days=7):
+            return permanent_calendar_id
         return current_calendar_id
-    week_start, _ = week_window(reference_date)
-    if event_date >= week_start + timedelta(days=7):
-        return permanent_calendar_id
-    return current_calendar_id
+
+    if archive_calendar_id:
+        arch_start, arch_end = archive_window(reference_date)
+        if arch_start <= event_date < arch_end:
+            return archive_calendar_id
+
+    return None
 
 
 def is_day_cancelled(day):
@@ -900,8 +993,20 @@ def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
     zároveň zrušená hodina (např. CH - Absence of class) a aktivní akce (např. Exk),
     odfiltruje zrušený atom v této hodině, aby nerozbil souvislou exkurzi.
     """
+    filtered, _ = split_day_atoms(raw_atoms, subjects, hours)
+    return filtered
+
+
+def split_day_atoms(raw_atoms, subjects, hours):
+    """
+    Rozdělí atomy daného dne na:
+    1. `filtered` - atomy pro hlavní rozvrh (kde zrušená hodina ve stejném slotu jako aktivní akce
+       je odfiltrována, aby nerozbila spojení exkurze).
+    2. `cancelled_atoms` - všechny zrušené atomy v daném dni (pro zápis do kalendáře smazaných hodin).
+    """
     valid_items = []
     active_hours = set()
+    cancelled_atoms = []
 
     for atom in raw_atoms:
         if not isinstance(atom, dict):
@@ -912,21 +1017,23 @@ def filter_and_sort_day_atoms(raw_atoms, subjects, hours):
             continue
         subject = subjects.get(atom.get("SubjectId"), "Hodina")
         is_canc = _is_cancelled(atom, subject)
-        if not is_canc:
+        if is_canc:
+            cancelled_atoms.append((atom, subject, hour_info))
+        else:
             active_hours.add(hour_id)
         valid_items.append((atom, subject, hour_info, is_canc, hour_id))
 
     # Pokud je v dané hodině (HourId) alespoň jeden aktivní atom (např. Exkurze),
-    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy (např. zrušená Chemie).
+    # zahodíme ze stejné hodiny případné duplicitní zrušené atomy pro hlavní kalendář.
     filtered = []
     for atom, subject, hour_info, is_canc, hour_id in valid_items:
         if is_canc and hour_id in active_hours:
             continue
         filtered.append((atom, subject, hour_info))
 
-    # Seřadíme podle času začátku hodiny (a případně necháme aktivní před zrušenými)
     filtered.sort(key=lambda item: (item[2][0], _is_cancelled(item[0], item[1])))
-    return filtered
+    cancelled_atoms.sort(key=lambda item: item[2][0])
+    return filtered, cancelled_atoms
 
 
 def group_special_event_atoms(atoms, start_index):
@@ -998,6 +1105,16 @@ def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
         raw_entry.get("permanent_calendar_id")
         or raw_entry.get("PERMANENT_CALENDAR_ID")
     )
+    archive_cal = (
+        raw_entry.get("archive_calendar_id")
+        or raw_entry.get("history_calendar_id")
+        or raw_entry.get("cancelled_calendar_id")
+        or raw_entry.get("canceled_calendar_id")
+        or raw_entry.get("ARCHIVE_CALENDAR_ID")
+        or raw_entry.get("HISTORY_CALENDAR_ID")
+        or raw_entry.get("CANCELLED_CALENDAR_ID")
+        or raw_entry.get("CANCELED_CALENDAR_ID")
+    )
     bak_url = (
         raw_entry.get("bak_url")
         or raw_entry.get("BAK_URL")
@@ -1010,9 +1127,9 @@ def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
         raise ValueError(
             f"Uživatel '{name}' nemá vyplněné přihlašovací údaje (user/password)."
         )
-    if not current_cal and not permanent_cal:
+    if not current_cal and not permanent_cal and not archive_cal:
         raise ValueError(
-            f"Uživatel '{name}' nemá nastavený žádný kalendář (calendar_id / permanent_calendar_id)."
+            f"Uživatel '{name}' nemá nastavený žádný kalendář (calendar_id / permanent_calendar_id / archive_calendar_id)."
         )
 
     return {
@@ -1021,6 +1138,7 @@ def _normalize_user_entry(raw_entry, index=1, default_bak_url=None):
         "password": str(password),
         "current_calendar_id": str(current_cal) if current_cal else None,
         "permanent_calendar_id": str(permanent_cal) if permanent_cal else None,
+        "archive_calendar_id": str(archive_cal) if archive_cal else None,
         "bak_url": bak_url,
     }
 
@@ -1060,6 +1178,10 @@ def load_users_config(env=None):
                     "current_calendar_id": env.get(f"CALENDAR_ID_{i}")
                     or env.get(f"CURRENT_CALENDAR_ID_{i}"),
                     "permanent_calendar_id": env.get(f"PERMANENT_CALENDAR_ID_{i}"),
+                    "archive_calendar_id": env.get(f"ARCHIVE_CALENDAR_ID_{i}")
+                    or env.get(f"HISTORY_CALENDAR_ID_{i}")
+                    or env.get(f"CANCELLED_CALENDAR_ID_{i}")
+                    or env.get(f"CANCELED_CALENDAR_ID_{i}"),
                     "bak_url": env.get(f"BAK_URL_{i}"),
                 }
             )
@@ -1078,6 +1200,10 @@ def load_users_config(env=None):
                     "current_calendar_id": env.get("CALENDAR_ID")
                     or env.get("CURRENT_CALENDAR_ID"),
                     "permanent_calendar_id": env.get("PERMANENT_CALENDAR_ID"),
+                    "archive_calendar_id": env.get("ARCHIVE_CALENDAR_ID")
+                    or env.get("HISTORY_CALENDAR_ID")
+                    or env.get("CANCELLED_CALENDAR_ID")
+                    or env.get("CANCELED_CALENDAR_ID"),
                     "bak_url": env.get("BAK_URL"),
                 }
             )
@@ -1122,6 +1248,11 @@ def sync_single_user(
     password = user_config["password"]
     current_calendar_id = user_config.get("current_calendar_id")
     permanent_calendar_id = user_config.get("permanent_calendar_id")
+    archive_calendar_id = (
+        user_config.get("archive_calendar_id")
+        or user_config.get("history_calendar_id")
+        or user_config.get("cancelled_calendar_id")
+    )
     user_bak_url = (user_config.get("bak_url") or BAK_URL).rstrip("/")
     user_base_url = f"{user_bak_url}/api/3"
 
@@ -1129,15 +1260,29 @@ def sync_single_user(
         today = datetime.now(ZoneInfo("Europe/Prague")).date()
     monday, window_end = week_window(today)
     cleanup_before = cleanup_cutoff_date(today)
+    arch_start, arch_end = archive_window(today)
 
+    # V hlavních kalendářích mažeme vše před cleanup_before (v pátek se maže minulý týden, od Po do Čt předminulý)
     expired_deleted = delete_expired_events(
         service,
         (current_calendar_id, permanent_calendar_id),
         cleanup_before,
     )
+    # V archivním kalendáři mažeme vše starší než ~2 měsíce (arch_start)
+    if archive_calendar_id:
+        expired_deleted += delete_expired_events(
+            service,
+            (archive_calendar_id,),
+            arch_start,
+        )
 
     token = get_bakalari_token(user, password, bak_url=user_bak_url)
     headers = {"Authorization": f"Bearer {token}"}
+
+    # Pokud je aktivní archivní kalendář, stahujeme celé okno (2 měsíce zpět až 1 měsíc dopředu),
+    # jinak stahujeme jen aktivní okno hlavního kalendáře.
+    fetch_start = arch_start if archive_calendar_id else monday
+    fetch_end = arch_end if archive_calendar_id else window_end
 
     data = fetch_timetable_for_date(
         headers, monday.isoformat(), base_url=user_base_url
@@ -1151,13 +1296,14 @@ def sync_single_user(
         response.raise_for_status()
         data = response.json()
 
-    week_cursor = monday + timedelta(days=7)
-    while week_cursor < window_end:
-        next_data = fetch_timetable_for_date(
-            headers, week_cursor.isoformat(), base_url=user_base_url
-        )
-        if next_data is not None:
-            data = merge_timetable_data(data, next_data)
+    week_cursor = fetch_start
+    while week_cursor < fetch_end:
+        if week_cursor != monday:
+            next_data = fetch_timetable_for_date(
+                headers, week_cursor.isoformat(), base_url=user_base_url
+            )
+            if next_data is not None:
+                data = merge_timetable_data(data, next_data)
         week_cursor += timedelta(days=7)
 
     if (
@@ -1193,7 +1339,7 @@ def sync_single_user(
         if not isinstance(day_abs, dict):
             continue
         date_str = str(day_abs.get("Date") or "")[:10]
-        if not (monday.isoformat() <= date_str < window_end.isoformat()):
+        if not (fetch_start.isoformat() <= date_str < fetch_end.isoformat()):
             continue
         
         total_missed = (
@@ -1268,9 +1414,35 @@ def sync_single_user(
 
     for day in data.get("Days", []):
         date_str = day.get("Date", "")[:10]
-        if not monday.isoformat() <= date_str < window_end.isoformat():
+        if not fetch_start.isoformat() <= date_str < fetch_end.isoformat():
             continue
         if is_day_cancelled(day):
+            continue
+
+        # Pokud jsme v režimu bez archivu, zpracováváme jen dny od pondělí aktuálního týdne
+        if not archive_calendar_id and not (monday.isoformat() <= date_str < window_end.isoformat()):
+            continue
+
+        # Pokud daný den leží v hlavním kalendáři (před pondělím aktuálního týdne, tj. minulý týden Po-Čt),
+        # ale nemáme zapnutý archiv, v hlavním kalendáři ho necháme být a nepřepisujeme,
+        # pokud ovšem nechceme aktualizovat i minulý týden. Pomocí select_calendar_id určíme cílový kalendář:
+        if not archive_calendar_id and date_str < monday.isoformat():
+            continue
+
+        target_calendar_id = select_calendar_id(
+            date_str,
+            current_calendar_id,
+            permanent_calendar_id,
+            today,
+            archive_calendar_id=archive_calendar_id,
+        )
+        if not target_calendar_id:
+            continue
+
+        # Aby v hlavním kalendáři zůstal zachován dosavadní chování (synchronizace od monday do window_end),
+        # pokud den spadá do minulého týdne (cleanup_before <= date < monday) a target je hlavní kalendář,
+        # necháme aktivní události v hlavním kalendáři, ale do archivu je nezapisujeme!
+        if target_calendar_id in (current_calendar_id, permanent_calendar_id) and date_str < monday.isoformat():
             continue
 
         atoms = filter_and_sort_day_atoms(day.get("Atoms", []), subjects, hours)
@@ -1282,9 +1454,7 @@ def sync_single_user(
             atom, subject, hour_info = atoms[index]
             start_time, _ = hour_info
             title = _special_title(atom, subject)
-            target_calendar_id = select_calendar_id(
-                date_str, current_calendar_id, permanent_calendar_id, today
-            )
+
             if _is_cancelled(atom, subject):
                 if _delete_event(
                     service,
@@ -1390,6 +1560,20 @@ def sync_single_user(
         window_end,
         active_events_by_calendar,
     )
+
+    # V archivním kalendáři vyčistíme všechny neaktivní události v celém okně (arch_start až arch_end),
+    # což zároveň automaticky smaže z archivu všechny hodiny, které teď leží v hlavním kalendáři!
+    if archive_calendar_id and archive_calendar_id not in (
+        current_calendar_id,
+        permanent_calendar_id,
+    ):
+        deleted += delete_stale_window_events(
+            service,
+            (archive_calendar_id,),
+            arch_start,
+            arch_end,
+            active_events_by_calendar,
+        )
 
     print(
         f"[{user_label}] Synchronizace úspěšně dokončena. "
