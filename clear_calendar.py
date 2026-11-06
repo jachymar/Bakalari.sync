@@ -46,20 +46,17 @@ def main():
                     )
                 )
                 
-                to_delete = []
                 for event in response.get("items", []):
                     event_id = event.get("id", "")
                     
                     # Náš synchronizační skript generuje ID striktně jako 32znakový MD5 hash
                     # (s případným sufixem _restored). Mažeme POUZE takové události.
                     if re.fullmatch(r"[0-9a-f]{32}(_restored)?", event_id):
-                        to_delete.append((cal_id, event_id))
-                
-                if to_delete:
-                    try:
-                        deleted_in_cal += sync.batch_delete_events(service, to_delete)
-                    except Exception as e:
-                        print(f"Chyba při mazání dávky: {e}")
+                        try:
+                            sync._delete_event(service, cal_id, event_id)
+                            deleted_in_cal += 1
+                        except Exception as e:
+                            print(f"Chyba při mazání {event_id}: {e}")
                             
                 page_token = response.get("nextPageToken")
                 if not page_token:
