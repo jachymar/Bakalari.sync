@@ -20,8 +20,16 @@ def main():
 
     for user in users:
         name = user.get("name", user["user"])
-        # Získáme unikátní kalendáře daného uživatele (aktuální i permanentní)
-        cals = set(c for c in [user.get("current_calendar_id"), user.get("permanent_calendar_id")] if c)
+        # Získáme unikátní kalendáře daného uživatele (aktuální, permanentní i archivní/historický)
+        cals = set(
+            c
+            for c in [
+                user.get("current_calendar_id"),
+                user.get("permanent_calendar_id"),
+                user.get("archive_calendar_id"),
+            ]
+            if c
+        )
         
         for cal_id in cals:
             print(f"[{name}] Mažu vygenerované události v kalendáři: {cal_id} ...")
