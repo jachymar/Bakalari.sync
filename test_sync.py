@@ -122,6 +122,62 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "current-calendar",
         )
 
+    def test_archive_calendar_excludes_main_calendar_days_and_covers_2_months_back_1_month_ahead(self):
+        """
+        Ověří, že archivní kalendář:
+        - pokrývá historii (až 9 týdnů zpět) a vzdálenou budoucnost (až 5 týdnů dopředu),
+        - nikdy nedostane hodiny, které jsou v hlavním kalendáři (žádné duplicity).
+        """
+        # Středa 2026-09-30 -> aktuální týden začíná 2026-09-28, v hlavním kalendáři je ještě minulý týden (od 2026-09-21)
+        wednesday = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
+
+        # Minulý týden (ve středu ještě nesmazaný z hlavního kalendáře) -> patří do hlavního kalendáře
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-09-22", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
+            ),
+            "main-cal",
+        )
+
+        # V pátek 2026-10-02 už je minulý týden (2026-09-22) z hlavního kalendáře smazaný -> přechází do archive-cal!
+        friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-09-22", "main-cal", None, friday, archive_calendar_id="archive-cal"
+            ),
+            "archive-cal",
+        )
+
+        # Předminulý týden / měsíc zpátky -> vždy v archive-cal
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-08-25", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
+            ),
+            "archive-cal",
+        )
+
+        # Týden za oknem hlavního kalendáře (cca 3-4 týdny dopředu) -> v archive-cal
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-10-26", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
+            ),
+            "archive-cal",
+        )
+
+        # Aktuální a příští týden -> vždy v hlavním kalendáři, ne v archive-cal
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-09-30", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
+            ),
+            "main-cal",
+        )
+        self.assertEqual(
+            sync.select_calendar_id(
+                "2026-10-07", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
+            ),
+            "main-cal",
+        )
+
     def test_week_window_rolls_over_on_monday(self):
         thursday = sync.datetime.strptime("2026-10-01", "%Y-%m-%d").date()
         friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
@@ -422,16 +478,20 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "BAK_USER_1": "student1",
             "BAK_PASS_1": "pass1",
             "CALENDAR_ID_1": "cal1",
+            "ARCHIVE_CALENDAR_ID_1": "arch1",
             "BAK_USER_2": "student2",
             "BAK_PASS_2": "pass2",
             "CURRENT_CALENDAR_ID_2": "cal2_cur",
             "PERMANENT_CALENDAR_ID_2": "cal2_perm",
+            "HISTORY_CALENDAR_ID_2": "arch2",
         }
         users_numbered = sync.load_users_config(numbered_env)
         self.assertEqual(len(users_numbered), 2)
         self.assertEqual(users_numbered[0]["user"], "student1")
+        self.assertEqual(users_numbered[0]["archive_calendar_id"], "arch1")
         self.assertEqual(users_numbered[1]["user"], "student2")
         self.assertEqual(users_numbered[1]["permanent_calendar_id"], "cal2_perm")
+        self.assertEqual(users_numbered[1]["archive_calendar_id"], "arch2")
 
     def test_main_synchronizes_multiple_users_concurrently(self):
         env = {
