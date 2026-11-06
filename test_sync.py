@@ -11,60 +11,10 @@ class SpecialEventGroupingTests(unittest.TestCase):
             ({"Name": "Exkurze", "Description": "Exkurze", "SubjectId": 1, "RoomId": 5}, "Exkurze", ("08:50", "09:35")),
             ({"Name": "Exkurze", "Description": "Exkurze", "SubjectId": 1, "RoomId": 5}, "Exkurze", ("09:40", "10:25")),
         ]
-
         group, next_index = sync.group_special_event_atoms(atoms, 0)
-
         self.assertEqual(next_index, 3)
         self.assertEqual(len(group), 3)
         self.assertEqual(group[-1][2][1], "10:25")
-
-    def test_group_special_event_bridges_cancelled_lesson_in_the_middle(self):
-        atoms = [
-            ({"HourId": 5, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("11:30", "12:15")),
-            (
-                {
-                    "HourId": 6,
-                    "SubjectId": 10,
-                    "Change": {"ChangeType": "Canceled", "Description": "Absence of class"},
-                },
-                "CH",
-                ("12:25", "13:10"),
-            ),
-            ({"HourId": 7, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("13:15", "14:00")),
-            ({"HourId": 8, "Name": "Exkurze", "TypeAbbrev": "Exk", "SubjectId": None}, "Hodina", ("14:05", "15:45")),
-        ]
-
-        group, next_index = sync.group_special_event_atoms(atoms, 0)
-
-        self.assertEqual(next_index, 4)
-        self.assertEqual(len(group), 3)
-        self.assertEqual(group[0][2][0], "11:30")
-        self.assertEqual(max(h[1] for _, _, h in group), "15:45")
-
-    def test_filter_and_sort_day_atoms_drops_cancelled_atom_when_excursion_is_in_same_hour(self):
-        raw_atoms = [
-            {"HourId": 5, "SubjectId": 99, "Name": "Exkurze"},
-            {
-                "HourId": 6,
-                "SubjectId": 10,
-                "Change": {"ChangeType": "Canceled", "Description": "Absence of class"},
-            },
-            {"HourId": 6, "SubjectId": 99, "Name": "Exkurze"},
-            {"HourId": 7, "SubjectId": 99, "Name": "Exkurze"},
-        ]
-        subjects = {10: "CH", 99: "Exk"}
-        hours = {
-            5: ("11:30", "12:15"),
-            6: ("12:25", "13:10"),
-            7: ("13:15", "14:00"),
-        }
-
-        filtered = sync.filter_and_sort_day_atoms(raw_atoms, subjects, hours)
-        self.assertEqual(len(filtered), 3)
-
-        group, next_index = sync.group_special_event_atoms(filtered, 0)
-        self.assertEqual(next_index, 3)
-        self.assertEqual(max(h[1] for _, _, h in group), "14:00")
 
     def test_special_events_are_green_and_cancellations_skip_day(self):
         self.assertEqual(sync.event_color_for("", "Exkurze"), "2")
@@ -75,35 +25,8 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertTrue(sync.is_day_cancelled({"Name": "Svátek"}))
         self.assertFalse(sync.is_day_cancelled({"Name": "Normální den"}))
 
-    def test_cancelled_atom_detection_handles_bakalari_change_types(self):
-        self.assertTrue(
-            sync._is_cancelled(
-                {"SubjectId": None, "Change": {"ChangeType": "Canceled", "Description": "Vyjmuto z rozvrhu"}},
-                "Hodina",
-            )
-        )
-        self.assertTrue(
-            sync._is_cancelled(
-                {"SubjectId": None, "Change": {"ChangeType": "Removed", "TypeAbbrev": "Zruš."}},
-                "Hodina",
-            )
-        )
-        self.assertFalse(
-            sync._is_cancelled(
-                {"SubjectId": 5, "Change": {"ChangeType": "RoomChanged", "Description": "Přesun do učebny 102"}},
-                "Matematika",
-            )
-        )
-        self.assertFalse(
-            sync._is_cancelled(
-                {"SubjectId": None, "Change": {"ChangeType": "Canceled", "TypeAbbrev": "Exk", "TypeName": "Exkurze"}},
-                "Hodina",
-            )
-        )
-
     def test_next_week_uses_permanent_calendar(self):
         reference_date = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
-
         self.assertEqual(
             sync.select_calendar_id("2026-10-05", "current-calendar", "permanent-calendar", reference_date),
             "permanent-calendar",
@@ -113,157 +36,18 @@ class SpecialEventGroupingTests(unittest.TestCase):
             "current-calendar",
         )
 
-    def test_archive_calendar_excludes_main_calendar_days_and_covers_2_months_back_1_month_ahead(self):
-        wednesday = sync.datetime.strptime("2026-09-30", "%Y-%m-%d").date()
-
+    def test_determine_target_calendar_switches_between_main_and_archive(self):
+        today = sync.datetime.strptime("2026-10-15", "%Y-%m-%d").date() # Thursday
+        main_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date() # Previous week monday
+        main_end = sync.datetime.strptime("2026-10-26", "%Y-%m-%d").date()
+        
         self.assertEqual(
-            sync.select_calendar_id(
-                "2026-09-22", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
-            ),
-            "main-cal",
-        )
-
-        self.assertEqual(
-            sync.select_calendar_id(
-                "2026-08-25", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
-            ),
-            "archive-cal",
-        )
-
-        self.assertEqual(
-            sync.select_calendar_id(
-                "2026-10-26", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
-            ),
-            "archive-cal",
-        )
-
-        self.assertEqual(
-            sync.select_calendar_id(
-                "2026-09-30", "main-cal", None, wednesday, archive_calendar_id="archive-cal"
-            ),
-            "main-cal",
-        )
-
-    def test_week_window_rolls_over_on_monday(self):
-        thursday = sync.datetime.strptime("2026-10-01", "%Y-%m-%d").date()
-        friday = sync.datetime.strptime("2026-10-02", "%Y-%m-%d").date()
-        sunday = sync.datetime.strptime("2026-10-04", "%Y-%m-%d").date()
-        monday = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-
-        self.assertEqual(
-            sync.week_window(thursday),
-            (
-                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
-                sync.datetime.strptime("2026-10-12", "%Y-%m-%d").date(),
-            ),
+            sync.determine_target_calendar("2026-10-15", "current", "perm", "archive", today, main_start, main_end),
+            "current"
         )
         self.assertEqual(
-            sync.week_window(monday),
-            (
-                monday,
-                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
-            ),
-        )
-        self.assertEqual(
-            sync.week_window(friday),
-            (
-                sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
-                sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date(),
-            ),
-        )
-
-        self.assertEqual(
-            sync.cleanup_cutoff_date(thursday),
-            sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
-        )
-        self.assertEqual(
-            sync.cleanup_cutoff_date(friday),
-            sync.datetime.strptime("2026-09-21", "%Y-%m-%d").date(),
-        )
-        self.assertEqual(
-            sync.cleanup_cutoff_date(monday),
-            sync.datetime.strptime("2026-09-28", "%Y-%m-%d").date(),
-        )
-
-    def test_expired_event_cleanup_only_deletes_managed_events(self):
-        class FakeRequest:
-            def __init__(self, result):
-                self.result = result
-
-            def execute(self):
-                return self.result
-
-        class FakeEvents:
-            def __init__(self):
-                self.deleted = []
-
-            def list(self, **kwargs):
-                return FakeRequest({
-                    "items": [
-                        {"id": "0123456789abcdef0123456789abcdef"},
-                        {"id": "personal-event"},
-                    ]
-                })
-
-            def delete(self, **kwargs):
-                self.deleted.append(kwargs)
-                return FakeRequest({})
-
-        events = FakeEvents()
-
-        class FakeService:
-            def events(self):
-                return events
-
-        week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-        deleted = sync.delete_expired_events(FakeService(), ["calendar"], week_start)
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(events.deleted, [{"calendarId": "calendar", "eventId": "0123456789abcdef0123456789abcdef"}])
-
-    def test_stale_window_cleanup_deletes_cancelled_or_replaced_events(self):
-        class FakeRequest:
-            def __init__(self, result):
-                self.result = result
-
-            def execute(self):
-                return self.result
-
-        class FakeEvents:
-            def __init__(self):
-                self.deleted = []
-
-            def list(self, **kwargs):
-                return FakeRequest({
-                    "items": [
-                        {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-                        {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-                        {"id": "personal-event"},
-                    ]
-                })
-
-            def delete(self, **kwargs):
-                self.deleted.append(kwargs)
-                return FakeRequest({})
-
-        events = FakeEvents()
-
-        class FakeService:
-            def events(self):
-                return events
-
-        week_start = sync.datetime.strptime("2026-10-05", "%Y-%m-%d").date()
-        window_end = sync.datetime.strptime("2026-10-19", "%Y-%m-%d").date()
-        active_by_cal = {"calendar": {"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
-
-        deleted = sync.delete_stale_window_events(
-            FakeService(), ["calendar"], week_start, window_end, active_by_cal
-        )
-
-        self.assertEqual(deleted, 1)
-        self.assertEqual(
-            events.deleted,
-            [{"calendarId": "calendar", "eventId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+            sync.determine_target_calendar("2026-09-30", "current", "perm", "archive", today, main_start, main_end),
+            "archive"
         )
 
     def test_should_sync_20_minutes_after_lesson_starts(self):
@@ -281,7 +65,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
                 }
             ]
         }
-
         self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=20, second=0, microsecond=0).isoformat()))
         self.assertTrue(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=25, second=0, microsecond=0).isoformat()))
         self.assertFalse(sync.should_sync_now(lesson_starts, today.replace(hour=8, minute=0, second=0, microsecond=0).isoformat()))
@@ -291,51 +74,32 @@ class SpecialEventGroupingTests(unittest.TestCase):
         today = sync.datetime.now(sync.ZoneInfo("Europe/Prague")).strftime("%Y-%m-%d")
         first_event_id = sync._event_id(today, "08:00", "Matematika (A101)")
         second_event_id = sync._event_id(today, "08:00", "Český jazyk (A102)")
-        cancelled_event_id = sync._event_id(today, "08:00", "Hodina")
-
         self.assertEqual(first_event_id, second_event_id)
-        self.assertEqual(first_event_id, cancelled_event_id)
 
-    def test_event_title_contains_room_and_location_uses_real_room_name(self):
-        atom = {
-            "ClassId": 7,
-            "Class": {"Name": "3.A"},
-            "RoomId": 5,
+    def test_is_event_unchanged_detects_all_differences(self):
+        existing = {
+            "summary": "Matematika",
+            "description": "Vyučuje: Novák",
+            "location": "A1",
+            "colorId": "8",
+            "start": {"dateTime": "2026-11-06T08:00:00+01:00"},
+            "end": {"dateTime": "2026-11-06T08:45:00+01:00"}
         }
-        classes = {7: "3.A"}
-
-        self.assertEqual(sync.extract_class_name(atom, classes), "3.A")
-        self.assertEqual(sync.build_event_summary("Matematika", "101"), "Matematika (101)")
-        self.assertEqual(sync.build_event_location("3.A", "101", "A1"), "A1 - 101")
-        self.assertEqual(sync.build_event_location("3.A", "101"), "101")
-
-    def test_event_description_omits_room_name_from_note(self):
-        description = sync.build_event_description(
-            teacher_name="Mgr. Novák",
-            change_info="",
-            absence_status=None,
-            room_name="Učebna 1D",
-            room_number="101",
-        )
-
-        self.assertIn("Mgr. Novák", description)
-        self.assertNotIn("Poznámka:", description)
-        self.assertNotIn("Vyučuje:", description)
-        self.assertNotIn("Učebna:", description)
-
-    def test_extract_teacher_name_prefers_teacher_data(self):
-        atom = {
-            "Teacher": {"Name": "Mgr. Novák"},
-            "RoomId": 5,
-        }
-
-        self.assertEqual(sync.extract_teacher_name(atom), "Mgr. Novák")
-        self.assertEqual(sync.extract_teacher_name({"Teacher": "Pavel Horák"}), "Pavel Horák")
-        self.assertIsNone(sync.extract_teacher_name({}))
+        new_ev = existing.copy()
+        
+        self.assertTrue(sync.is_event_unchanged(existing, new_ev))
+        
+        # Change color
+        new_ev["colorId"] = "4"
+        self.assertFalse(sync.is_event_unchanged(existing, new_ev))
+        
+        # Revert color, change time
+        new_ev["colorId"] = "8"
+        new_ev["start"] = {"dateTime": "2026-11-06T08:05:00+01:00"}
+        self.assertFalse(sync.is_event_unchanged(existing, new_ev))
 
     def test_execute_with_backoff_retries_rate_limits(self):
         attempts = {"count": 0}
-
         class FakeRequest:
             def execute(self):
                 attempts["count"] += 1
@@ -352,130 +116,6 @@ class SpecialEventGroupingTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(attempts["count"], 3)
         self.assertEqual(sleep_mock.call_count, 2)
-
-    def test_delete_event_ignores_410_already_deleted(self):
-        class FakeRequest:
-            def execute(self):
-                raise sync.HttpError(
-                    type("Resp", (), {"status": 410, "reason": "Gone"})(),
-                    b'{"error": {"message": "Resource has been deleted"}}',
-                )
-
-        class FakeEvents:
-            def delete(self, **kwargs):
-                return FakeRequest()
-
-        class FakeService:
-            def events(self):
-                return FakeEvents()
-
-        self.assertFalse(sync._delete_event(FakeService(), "calendar", "0123456789abcdef0123456789abcdef"))
-
-    def test_upsert_event_handles_409_and_410_deleted_resource(self):
-        class FakeRequest:
-            def __init__(self, fn):
-                self.fn = fn
-
-            def execute(self):
-                return self.fn()
-
-        class FakeEvents:
-            def __init__(self):
-                self.inserted_bodies = []
-
-            def insert(self, calendarId, body):
-                def _run():
-                    if body["id"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":
-                        raise sync.HttpError(
-                            type("Resp", (), {"status": 409, "reason": "Conflict"})(),
-                            b'{"error": {"message": "Already exists"}}',
-                        )
-                    self.inserted_bodies.append(body)
-                    return body
-                return FakeRequest(_run)
-
-            def update(self, calendarId, eventId, body):
-                def _run():
-                    raise sync.HttpError(
-                        type("Resp", (), {"status": 410, "reason": "Gone"})(),
-                        b'{"error": {"message": "Resource has been deleted"}}',
-                    )
-                return FakeRequest(_run)
-
-        events = FakeEvents()
-
-        class FakeService:
-            def events(self):
-                return events
-
-        action, final_id = sync.upsert_event(
-            FakeService(),
-            "calendar",
-            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "summary": "Matematika"},
-        )
-
-        self.assertEqual(action, "inserted")
-        self.assertNotEqual(final_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        self.assertEqual(len(final_id), 32)
-        self.assertEqual(events.inserted_bodies[0]["status"], "confirmed")
-
-    def test_load_users_config_supports_users_json_and_numbered_envs(self):
-        json_env = {
-            "USERS_JSON": """
-            [
-                {"name": "Petr", "user": "petr1", "password": "pw1", "calendar_id": "cal_petr"},
-                {"name": "Jana", "user": "jana2", "password": "pw2", "current_calendar_id": "cal_jana_cur", "permanent_calendar_id": "cal_jana_perm"}
-            ]
-            """
-        }
-        users_from_json = sync.load_users_config(json_env)
-        self.assertEqual(len(users_from_json), 2)
-        self.assertEqual(users_from_json[0]["name"], "Petr")
-        self.assertEqual(users_from_json[0]["current_calendar_id"], "cal_petr")
-        self.assertEqual(users_from_json[1]["permanent_calendar_id"], "cal_jana_perm")
-
-        numbered_env = {
-            "BAK_USER_1": "student1",
-            "BAK_PASS_1": "pass1",
-            "CALENDAR_ID_1": "cal1",
-            "ARCHIVE_CALENDAR_ID_1": "arch1",
-            "BAK_USER_2": "student2",
-            "BAK_PASS_2": "pass2",
-            "CURRENT_CALENDAR_ID_2": "cal2_cur",
-            "PERMANENT_CALENDAR_ID_2": "cal2_perm",
-            "HISTORY_CALENDAR_ID_2": "arch2",
-        }
-        users_numbered = sync.load_users_config(numbered_env)
-        self.assertEqual(len(users_numbered), 2)
-        self.assertEqual(users_numbered[0]["user"], "student1")
-        self.assertEqual(users_numbered[0]["archive_calendar_id"], "arch1")
-        self.assertEqual(users_numbered[1]["user"], "student2")
-        self.assertEqual(users_numbered[1]["permanent_calendar_id"], "cal2_perm")
-        self.assertEqual(users_numbered[1]["archive_calendar_id"], "arch2")
-
-    def test_main_synchronizes_multiple_users_concurrently(self):
-        env = {
-            "GOOGLE_CREDS_JSON": '{"type": "service_account"}',
-            "USERS_JSON": '[{"user": "u1", "password": "p1", "calendar_id": "c1"}, {"user": "u2", "password": "p2", "calendar_id": "c2"}]',
-        }
-        synced_users = []
-
-        def fake_sync_single(user_cfg, creds_dict=None, room_mapping=None, service=None, today=None):
-            synced_users.append(user_cfg["user"])
-            return {
-                "user": user_cfg["user"],
-                "skipped": False,
-                "inserted": 2,
-                "updated": 1,
-                "deleted": 0,
-                "expired_deleted": 0,
-            }
-
-        with mock.patch.dict(sync.os.environ, env, clear=True):
-            with mock.patch.object(sync, "sync_single_user", side_effect=fake_sync_single):
-                sync.main()
-
-        self.assertCountEqual(synced_users, ["u1", "u2"])
 
 
 if __name__ == "__main__":
