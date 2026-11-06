@@ -37,12 +37,17 @@ jobs:
       - name: Run selected action
         env:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          USERS_JSON: ${{ secrets.USERS_JSON }}
           BAK_USER_1: ${{ secrets.BAK_USER_1 }}
           BAK_PASS_1: ${{ secrets.BAK_PASS_1 }}
           CALENDAR_ID_1: ${{ secrets.CALENDAR_ID_1 }}
+          ARCHIVE_CALENDAR_ID_1: ${{ secrets.ARCHIVE_CALENDAR_ID_1 }}
+          HISTORY_CALENDAR_ID_1: ${{ secrets.HISTORY_CALENDAR_ID_1 }}
           BAK_USER_2: ${{ secrets.BAK_USER_2 }}
           BAK_PASS_2: ${{ secrets.BAK_PASS_2 }}
           CALENDAR_ID_2: ${{ secrets.CALENDAR_ID_2 }}
+          ARCHIVE_CALENDAR_ID_2: ${{ secrets.ARCHIVE_CALENDAR_ID_2 }}
+          HISTORY_CALENDAR_ID_2: ${{ secrets.HISTORY_CALENDAR_ID_2 }}
           BAK_URL: "https://gyarab.bakalari.cz"
           RESPECT_20MIN_RULE: "false"
         run: |
