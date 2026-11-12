@@ -287,12 +287,107 @@ def _is_cancelled(atom, subject):
     return any(word in text for word in CANCELLED_WORDS)
 
 
-def _change_description(atom):
+def parse_czech_date(date_str, reference_date):
+    """Zkusí v textu najít české datum (např. '12.11.' nebo '1. 2.') a vrátí ho jako objekt date."""
+    if not date_str:
+        return None
+    match = re.search(r"(\d{1,2})\.\s*(\d{1,2})\.", date_str)
+    if not match:
+        return None
+    day, month = int(match.group(1)), int(match.group(2))
+    
+    # Odvodíme rok z data konání události (s ohledem na přelom roku)
+    year = reference_date.year
+    if month == 12 and reference_date.month == 1:
+        year -= 1
+    elif month == 1 and reference_date.month == 12:
+        year += 1
+        
+    try:
+        return datetime(year, month, day).date()
+    except ValueError:
+        return None
+
+
+def get_czech_day_name_from(dt):
+    """Vrátí správný tvar dne v týdnu pro přesunutou hodinu."""
+    days = ["z pondělí", "z úterý", "ze středy", "ze čtvrtka", "z pátku", "ze soboty", "z neděle"]
+    return days[dt.weekday()]
+
+
+def format_moved_text(origin_date, event_date):
+    """Vypočítá rozdíl týdnů a vygeneruje čistou, lidsky čitelnou větu."""
+    if not origin_date:
+        return "Přesunuto"
+        
+    day_str = get_czech_day_name_from(origin_date)
+    date_formatted = f"{origin_date.day}. {origin_date.month}."
+    
+    # Vypočítáme rozdíl týdnů porovnáním pondělků (bezpečné vůči přelomům let)
+    orig_monday = origin_date - timedelta(days=origin_date.weekday())
+    event_monday = event_date - timedelta(days=event_date.weekday())
+    week_diff = (event_monday - orig_monday).days // 7
+    
+    if week_diff == 0:
+        return f"Přesunuto {day_str} ({date_formatted})"
+    elif week_diff == 1:
+        return f"Přesunuto {day_str} předchozího týdne ({date_formatted})"
+    elif week_diff == -1:
+        return f"Přesunuto {day_str} následujícího týdne ({date_formatted})"
+    elif week_diff > 1:
+        return f"Přesunuto {day_str} před {week_diff} týdny ({date_formatted})"
+    elif week_diff < -1:
+        abs_diff = abs(week_diff)
+        if abs_diff < 5:
+            return f"Přesunuto {day_str} za {abs_diff} týdny ({date_formatted})"
+        else:
+            return f"Přesunuto {day_str} za {abs_diff} týdnů ({date_formatted})"
+        
+    return "Přesunuto"
+
+
+def _change_description(atom, event_date_str, current_teacher=None):
+    """Vytvoří přesný a dynamický popis toho, k jaké změně v hodině došlo."""
     change = atom.get("Change")
-    if isinstance(change, dict):
-        return str(
-            change.get("Description") or change.get("Name") or change.get("TypeAbbrev") or ""
-        ).strip()
+    if not isinstance(change, dict):
+        return ""
+        
+    change_type = str(change.get("ChangeType") or "").strip().casefold()
+    description = str(change.get("Description") or change.get("Name") or change.get("TypeAbbrev") or "").strip()
+    
+    parts = []
+    desc_lower = description.casefold()
+    is_moved = change_type == "moved" or "přesun" in desc_lower
+    is_subst = change_type == "substitution" or "supl" in desc_lower
+    
+    # 1. Řešení přesunu (dynamický čas)
+    if is_moved:
+        try:
+            event_date = datetime.strptime(event_date_str, "%Y-%m-%d").date()
+            origin_date = parse_czech_date(description, event_date)
+            parts.append(format_moved_text(origin_date, event_date))
+        except ValueError:
+            parts.append("Přesunuto")
+            
+    # 2. Řešení suplování (čisté jméno)
+    if is_subst:
+        if current_teacher:
+            parts.append(f"Suplování: {current_teacher}")
+        else:
+            parts.append("Suplování")
+            
+    # Pokud se stalo obojí (Přesun i Suplování), složíme to hezky k sobě
+    if parts:
+        return " | ".join(parts)
+        
+    # 3. Změna samotné učebny se do popisu nehlásí
+    if change_type == "roomchange":
+        return ""
+        
+    # 4. Pokud je tam nějaká jiná změna (nespecifikovaná)
+    if change_type or description:
+        return "Změna v rozvrhu"
+        
     return ""
 
 
@@ -363,14 +458,24 @@ def build_event_location(class_name, room, room_name=None):
 
 def build_event_description(teacher_name=None, change_info="", absence_status=None, room_name=None, room_number=None):
     description_parts = []
-    if teacher_name:
-        description_parts.append(teacher_name)
-    elif not change_info:
-        description_parts.append("Běžná hodina")
-    if change_info:
-        description_parts.append(f"Změna/Suplování: {change_info}")
+    
+    # Pokud jde o suplování, jméno učitele (Suplování: Novák) už zformátoval _change_description. 
+    # Nemusíme ho tedy psát na první řádek podruhé.
+    if change_info and "Suplování" in change_info:
+        description_parts.append(change_info)
+    else:
+        # Standardní hodina nebo přesun stejným učitelem
+        if teacher_name:
+            description_parts.append(teacher_name)
+        elif not change_info:
+            description_parts.append("Běžná hodina")
+            
+        if change_info:
+            description_parts.append(change_info)
+
     if absence_status:
         description_parts.append(f"Absence: {absence_status}")
+        
     return "\n".join(description_parts)
 
 
@@ -885,8 +990,8 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
     main_start = cleanup_cutoff_date(today)
 
     if archive_calendar_id:
-        sync_start = monday - timedelta(days=28) # 1 měsíc dozadu pro stahování z Bakalářů
         archive_cleanup_start = monday - timedelta(days=63) # 9 týdnů zpět (na promazání staré historie)
+        sync_start = archive_cleanup_start # Stahuje a porovnává celé aktivní archivované okno
     else:
         sync_start = main_start
         
@@ -908,7 +1013,7 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
     token = get_bakalari_token(user, password, bak_url=user_bak_url)
     headers = {"Authorization": f"Bearer {token}"}
 
-    # 3. Stažení rozvrhu
+    # 3. Stažení rozvrhu (bere z celého archivovaného okna)
     data = fetch_timetable_for_date(headers, sync_start.isoformat(), base_url=user_base_url)
     if data is None:
         data = requests.get(f"{user_base_url}/timetable/actual", headers=headers, timeout=30).json()
@@ -1003,7 +1108,6 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
             room = rooms.get(first_atom.get("RoomId"), "")
             room_name = room_names.get(first_atom.get("RoomId"), room)
             class_name = extract_class_name(first_atom, classes)
-            change_info = _change_description(first_atom)
             
             absence_status = absences.get((date_str, str(first_atom.get("HourId"))))
             if not absence_status:
@@ -1011,7 +1115,10 @@ def sync_single_user(user_config, creds_dict=None, room_mapping=None, service=No
                 if subj_full_name:
                     absence_status = absences_by_subject.get((date_str, subj_full_name))
 
+            # Získáme učitele první a až následně ho předáme k vygenerování čistého textu změny
             teacher_name = extract_teacher_name(first_atom, teachers)
+            change_info = _change_description(first_atom, date_str, teacher_name)
+            
             summary = build_event_summary(subject, room, title)
             location = build_event_location(class_name, room, room_name)
             description = build_event_description(
