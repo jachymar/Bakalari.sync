@@ -320,6 +320,9 @@ def format_moved_text(origin_date, event_date):
     if not origin_date:
         return "Přesunuto"
         
+    if origin_date == event_date:
+        return ""
+        
     day_str = get_czech_day_name_from(origin_date)
     date_formatted = f"{origin_date.day}. {origin_date.month}."
     
@@ -365,7 +368,9 @@ def _change_description(atom, event_date_str, current_teacher=None):
         try:
             event_date = datetime.strptime(event_date_str, "%Y-%m-%d").date()
             origin_date = parse_czech_date(description, event_date)
-            parts.append(format_moved_text(origin_date, event_date))
+            moved_text = format_moved_text(origin_date, event_date)
+            if moved_text:
+                parts.append(moved_text)
         except ValueError:
             parts.append("Přesunuto")
             
